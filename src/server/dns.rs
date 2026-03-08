@@ -1,9 +1,12 @@
 use anyhow::{Context, bail, ensure};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
+
+use crate::config::{IpStrategy, OutboundConfig};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 static NEXT_QUERY_ID: AtomicU16 = AtomicU16::new(1);
@@ -14,27 +17,85 @@ enum RecordType {
     Aaaa = 28,
 }
 
-pub async fn resolve_domain(host: &str, nameserver: Option<&str>) -> anyhow::Result<Vec<IpAddr>> {
-    if let Some(nameserver) = nameserver {
-        let mut resolved = resolve_with_server(host, nameserver, RecordType::A).await?;
-        if resolved.is_empty() {
-            resolved = resolve_with_server(host, nameserver, RecordType::Aaaa).await?;
-        }
-        if resolved.is_empty() {
-            bail!("no DNS answers for {host} from nameserver {nameserver}");
-        }
-        return Ok(resolved);
+pub async fn resolve_domain(
+    host: &str,
+    route_nameserver: Option<&str>,
+    outbound: &OutboundConfig,
+) -> anyhow::Result<Vec<IpAddr>> {
+    if let Some(nameserver) = route_nameserver.filter(|value| !value.trim().is_empty()) {
+        return resolve_with_nameserver(host, nameserver, outbound.ip_strategy).await;
     }
 
-    let resolved = lookup_host((host, 0))
+    if let Some(nameserver) = outbound.dns_resolver.nameserver() {
+        return resolve_with_nameserver(host, nameserver, outbound.ip_strategy).await;
+    }
+
+    let mut resolved = lookup_host((host, 0))
         .await
         .with_context(|| format!("resolve {host} via system DNS"))?
         .map(|addr| addr.ip())
         .collect::<Vec<_>>();
+    reorder_ips(&mut resolved, outbound.ip_strategy);
+    dedup_ips(&mut resolved);
     if resolved.is_empty() {
         bail!("no addresses resolved for {host}")
     }
     Ok(resolved)
+}
+
+async fn resolve_with_nameserver(
+    host: &str,
+    nameserver: &str,
+    ip_strategy: IpStrategy,
+) -> anyhow::Result<Vec<IpAddr>> {
+    let ipv4 = resolve_with_server(host, nameserver, RecordType::A).await;
+    let ipv6 = resolve_with_server(host, nameserver, RecordType::Aaaa).await;
+
+    let mut resolved = Vec::new();
+    match ip_strategy {
+        IpStrategy::PreferIpv6 => {
+            append_query_result(&mut resolved, ipv6.as_ref());
+            append_query_result(&mut resolved, ipv4.as_ref());
+        }
+        IpStrategy::System | IpStrategy::PreferIpv4 => {
+            append_query_result(&mut resolved, ipv4.as_ref());
+            append_query_result(&mut resolved, ipv6.as_ref());
+        }
+    }
+    dedup_ips(&mut resolved);
+
+    if !resolved.is_empty() {
+        return Ok(resolved);
+    }
+
+    match (ipv4, ipv6) {
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+        _ => bail!("no DNS answers for {host} from nameserver {nameserver}"),
+    }
+}
+
+fn append_query_result(target: &mut Vec<IpAddr>, result: Result<&Vec<IpAddr>, &anyhow::Error>) {
+    if let Ok(records) = result {
+        target.extend(records.iter().copied());
+    }
+}
+
+fn reorder_ips(resolved: &mut Vec<IpAddr>, ip_strategy: IpStrategy) {
+    match ip_strategy {
+        IpStrategy::System => {}
+        IpStrategy::PreferIpv4 => {
+            resolved.sort_by_key(|ip| if ip.is_ipv4() { 0 } else { 1 });
+        }
+        IpStrategy::PreferIpv6 => {
+            resolved.sort_by_key(|ip| if ip.is_ipv6() { 0 } else { 1 });
+        }
+    }
+}
+
+fn dedup_ips(resolved: &mut Vec<IpAddr>) {
+    let mut seen = HashSet::new();
+    resolved.retain(|ip| seen.insert(*ip));
 }
 
 async fn resolve_with_server(
@@ -287,5 +348,33 @@ mod tests {
         ];
         let parsed = parse_response(&response, 0x1234, RecordType::A).expect("parse response");
         assert_eq!(parsed, vec![IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
+    }
+
+    #[test]
+    fn reorders_ips_by_strategy() {
+        let mut ips = vec![
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        ];
+        reorder_ips(&mut ips, IpStrategy::PreferIpv4);
+        assert!(ips[0].is_ipv4());
+        assert!(ips[1].is_ipv4());
+
+        reorder_ips(&mut ips, IpStrategy::PreferIpv6);
+        assert!(ips[0].is_ipv6());
+    }
+
+    #[test]
+    fn deduplicates_while_preserving_order() {
+        let mut ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        dedup_ips(&mut ips);
+        assert_eq!(ips.len(), 2);
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(ips[1], IpAddr::V6(Ipv6Addr::LOCALHOST));
     }
 }

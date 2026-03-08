@@ -14,6 +14,8 @@ ACME_DOMAIN=""
 ACME_EMAIL=""
 ACME_CHALLENGE_LISTEN="0.0.0.0:80"
 TLS_SERVER_NAME=""
+DNS_RESOLVER="system"
+IP_STRATEGY="system"
 NO_SERVICE=0
 UNINSTALL=0
 REMOVE_ALL=0
@@ -60,6 +62,8 @@ Options:
   --acme-domain <fqdn>        Enable embedded ACME HTTP-01 for this domain
   --acme-email <mailbox>      Contact email for ACME account registration
   --server-name <fqdn>        Write local tls.server_name; overrides panel value at runtime
+  --dns-resolver <value>      Outbound DNS: system or a custom nameserver like 1.1.1.1
+  --ip-strategy <value>       Outbound IP order: system, prefer_ipv4, prefer_ipv6
   --acme-challenge-listen <addr>
                               HTTP-01 listener address, default: 0.0.0.0:80
   --uninstall                 Remove installed service(s), binary, and related files
@@ -145,6 +149,14 @@ parse_args() {
         ;;
       --server-name)
         TLS_SERVER_NAME="$2"
+        shift 2
+        ;;
+      --dns-resolver)
+        DNS_RESOLVER="$2"
+        shift 2
+        ;;
+      --ip-strategy)
+        IP_STRATEGY="$2"
         shift 2
         ;;
       --acme-challenge-listen)
@@ -258,7 +270,7 @@ sed_escape() {
 }
 
 render_config_file() {
-  local template_path target_path panel_url panel_token node_id cert_path key_path tls_server_name acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_tls_server_name escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
+  local template_path target_path panel_url panel_token node_id cert_path key_path tls_server_name acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_tls_server_name escaped_dns_resolver escaped_ip_strategy escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
   template_path="$1"
   target_path="$2"
   panel_url="$3"
@@ -277,6 +289,8 @@ render_config_file() {
   escaped_cert="$(sed_escape "$cert_path")"
   escaped_key="$(sed_escape "$key_path")"
   escaped_tls_server_name="$(sed_escape "$tls_server_name")"
+  escaped_dns_resolver="$(sed_escape "$DNS_RESOLVER")"
+  escaped_ip_strategy="$(sed_escape "$IP_STRATEGY")"
   escaped_acme_domain="$(sed_escape "$acme_domain")"
   escaped_acme_email="$(sed_escape "$ACME_EMAIL")"
   escaped_acme_challenge="$(sed_escape "$ACME_CHALLENGE_LISTEN")"
@@ -289,6 +303,8 @@ render_config_file() {
     -e "s#cert_path = \"cert.pem\"#cert_path = \"$escaped_cert\"#g" \
     -e "s#key_path = \"key.pem\"#key_path = \"$escaped_key\"#g" \
     -e "s#server_name = \"\"#server_name = \"$escaped_tls_server_name\"#g" \
+    -e "s#dns_resolver = \"system\"#dns_resolver = \"$escaped_dns_resolver\"#g" \
+    -e "s#ip_strategy = \"system\"#ip_strategy = \"$escaped_ip_strategy\"#g" \
     -e "s#enabled = false#enabled = $acme_enabled#g" \
     -e "s#email = \"admin@example.com\"#email = \"$escaped_acme_email\"#g" \
     -e "s#domain = \"node.example.com\"#domain = \"$escaped_acme_domain\"#g" \

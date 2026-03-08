@@ -1,5 +1,5 @@
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub panel: PanelConfig,
     pub node: NodeConfig,
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub outbound: OutboundConfig,
     #[serde(default)]
     pub sync: SyncConfig,
     #[serde(default)]
@@ -62,6 +64,56 @@ pub struct TlsConfig {
     pub reload_interval_seconds: u64,
     #[serde(default)]
     pub acme: Option<AcmeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OutboundConfig {
+    #[serde(default)]
+    pub dns_resolver: DnsResolver,
+    #[serde(default)]
+    pub ip_strategy: IpStrategy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DnsResolver {
+    #[default]
+    System,
+    Custom(String),
+}
+
+impl DnsResolver {
+    pub fn nameserver(&self) -> Option<&str> {
+        match self {
+            Self::System => None,
+            Self::Custom(server) => Some(server.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DnsResolver {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?.unwrap_or_default();
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("system") {
+            Ok(Self::System)
+        } else {
+            Ok(Self::Custom(value.to_string()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpStrategy {
+    #[default]
+    System,
+    #[serde(alias = "ipv4_prefer", alias = "ipv4_first")]
+    PreferIpv4,
+    #[serde(alias = "ipv6_prefer", alias = "ipv6_first")]
+    PreferIpv6,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -186,5 +238,38 @@ fn default_log_level() -> String {
 fn resolve_path(base_dir: &Path, path: &mut PathBuf) {
     if path.is_relative() {
         *path = base_dir.join(&*path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_outbound_defaults_and_aliases() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            outbound: OutboundConfig,
+        }
+
+        let parsed: Wrapper = toml::from_str(
+            r#"
+                [outbound]
+                dns_resolver = "1.1.1.1"
+                ip_strategy = "ipv6_first"
+            "#,
+        )
+        .expect("parse outbound config");
+
+        assert_eq!(
+            parsed.outbound.dns_resolver,
+            DnsResolver::Custom("1.1.1.1".to_string())
+        );
+        assert_eq!(parsed.outbound.ip_strategy, IpStrategy::PreferIpv6);
+
+        let defaulted: Wrapper = toml::from_str("").expect("parse defaults");
+        assert_eq!(defaulted.outbound.dns_resolver, DnsResolver::System);
+        assert_eq!(defaulted.outbound.ip_strategy, IpStrategy::System);
     }
 }

@@ -12,6 +12,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
+use crate::config::OutboundConfig;
 use crate::limiter::SharedRateLimiter;
 
 use super::dns;
@@ -39,6 +40,7 @@ pub async fn serve_connection(
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
     route_rules: RouteRules,
+    outbound: OutboundConfig,
 ) -> anyhow::Result<()> {
     let user = authenticate(&mut stream, &accounting).await?;
     let lease = accounting.open_session(&user, source)?;
@@ -51,6 +53,7 @@ pub async fn serve_connection(
         accounting.clone(),
         padding,
         route_rules,
+        outbound,
     );
     let result = session.run().await;
     if control.is_cancelled() {
@@ -91,6 +94,7 @@ struct Session {
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
     route_rules: RouteRules,
+    outbound: OutboundConfig,
     reader: Mutex<ReadHalf<TlsStream>>,
     writer: Arc<Mutex<WriteHalf<TlsStream>>>,
     state: Arc<Mutex<SessionState>>,
@@ -117,6 +121,7 @@ impl Session {
         accounting: Arc<Accounting>,
         padding: PaddingScheme,
         route_rules: RouteRules,
+        outbound: OutboundConfig,
     ) -> Self {
         let (reader, writer) = split(stream);
         Self {
@@ -126,6 +131,7 @@ impl Session {
             accounting,
             padding,
             route_rules,
+            outbound,
             reader: Mutex::new(reader),
             writer: Arc::new(Mutex::new(writer)),
             state: Arc::new(Mutex::new(SessionState::default())),
@@ -251,6 +257,7 @@ impl Session {
         let control = self.lease.control();
         let limiter = self.lease.limiter();
         let route_rules = self.route_rules.clone();
+        let outbound = self.outbound.clone();
         tokio::spawn(async move {
             if let Err(error) = handle_stream(
                 stream_id,
@@ -262,6 +269,7 @@ impl Session {
                 control,
                 limiter,
                 route_rules,
+                outbound,
                 peer_version >= 2,
             )
             .await
@@ -380,6 +388,7 @@ async fn handle_stream(
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
+    outbound: OutboundConfig,
     send_synack: bool,
 ) -> anyhow::Result<()> {
     if control.is_cancelled() {
@@ -395,7 +404,7 @@ async fn handle_stream(
         }
         return Err(error);
     }
-    let mut remote = connect_destination(&destination, &route_rules)
+    let mut remote = connect_destination(&destination, &route_rules, &outbound)
         .await
         .with_context(|| format!("connect remote destination {destination}"));
 
@@ -512,6 +521,7 @@ async fn write_frame(
 async fn connect_destination(
     destination: &SocksAddr,
     route_rules: &RouteRules,
+    outbound: &OutboundConfig,
 ) -> anyhow::Result<TcpStream> {
     match destination {
         SocksAddr::Ip(addr) => TcpStream::connect(addr)
@@ -519,7 +529,7 @@ async fn connect_destination(
             .context("connect IP destination"),
         SocksAddr::Domain(host, port) => {
             let dns_server = route_rules.dns_server_for(host);
-            let resolved = dns::resolve_domain(host, dns_server)
+            let resolved = dns::resolve_domain(host, dns_server, outbound)
                 .await
                 .with_context(|| format!("resolve {host}:{port}"))?;
             let mut last_error = None;

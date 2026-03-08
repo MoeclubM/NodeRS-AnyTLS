@@ -15,6 +15,10 @@ key_path = "key.pem"
 server_name = ""
 reload_interval_seconds = 60
 
+[outbound]
+dns_resolver = "system"
+ip_strategy = "system"
+
 [tls.acme]
 enabled = false
 directory_url = "https://acme-v02.api.letsencrypt.org/directory"

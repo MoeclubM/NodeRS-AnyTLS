@@ -25,6 +25,7 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 - Server-side AnyTLS padding negotiation is implemented by accepting client preface padding and sending `UPDATE_PADDING_SCHEME` when `padding-md5` mismatches
 - Active record padding generation is a client-side behavior in the upstream AnyTLS reference implementation, so it is intentionally not emitted by this server
 - Local `tls.server_name` takes precedence over panel `server_name`
+- Wildcard listen now binds IPv4 and IPv6 simultaneously on Linux when available
 - Certificate files are hot-reloaded from disk according to `tls.reload_interval_seconds`
 - Embedded ACME HTTP-01 is implemented in pure Rust under `src/acme.rs`; issued certificates are renewed before expiry and reloaded automatically
 - ACME renewal timing is computed from the current certificate `notAfter` field rather than a fixed timer guess
@@ -55,8 +56,10 @@ DNS routes are applied only to domain targets. IP targets bypass DNS rules.
 1. Copy `config.example.toml` to `config.toml`
 2. Fill `panel.url`, `panel.token`, `panel.node_id`, `tls.cert_path`, `tls.key_path`
 3. Optional: set `tls.server_name`; when present it overrides panel `server_name`
-4. Optional: enable `[tls.acme]` for built-in HTTP-01 certificate issuance
-5. Run `cargo run --offline -- config.toml`
+4. Optional: set `[outbound] dns_resolver` to `system` or a custom server such as `1.1.1.1`
+5. Optional: set `[outbound] ip_strategy` to `system`, `prefer_ipv4`, or `prefer_ipv6`
+6. Optional: enable `[tls.acme]` for built-in HTTP-01 certificate issuance
+7. Run `cargo run --offline -- config.toml`
 
 ## Release Packaging
 
@@ -132,6 +135,18 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --server-name node.example.com
 ```
 
+**Outbound DNS and IP preference**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token server_token \
+  --node-id 1 \
+  --server-name node.example.com \
+  --dns-resolver 1.1.1.1 \
+  --ip-strategy prefer_ipv6
+```
+
 Default install paths:
 
 - Binary: `/usr/local/bin/noders-anytls`
@@ -149,6 +164,7 @@ When running as root on a systemd host, the script installs, enables, and starts
 If `--acme-domain` is used, the installer enables `[tls.acme]` in `config.toml` and skips self-signed generation.
 If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer tries to fetch `server_name` from Xboard and auto-generates a per-node self-signed certificate when no certificate already exists.
 If `--server-name` is passed, the installer writes `tls.server_name` locally and that value takes precedence over the panel response at runtime.
+If `--dns-resolver` is set to `system`, the node uses the system resolver; any other value is treated as a custom nameserver. `--ip-strategy` controls address ordering for domain outbound connections.
 
 ### Uninstall
 
