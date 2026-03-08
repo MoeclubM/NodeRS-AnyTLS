@@ -9,8 +9,6 @@ STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
 VERSION="latest"
-SELF_SIGNED_DOMAIN=""
-ACME_DOMAIN=""
 ACME_EMAIL=""
 ACME_CHALLENGE_LISTEN="[::]:80"
 TLS_SERVER_NAME=""
@@ -58,10 +56,10 @@ Options:
   --panel-token <token>       Single-node Xboard server_token
   --node-id <id>              Single-node Xboard node id
   --xboard <url> <token> <id> Add one Xboard node triplet; may be repeated
-  --self-signed-domain <fqdn> Generate a self-signed certificate into the config directory
-  --acme-domain <fqdn>        Enable embedded ACME HTTP-01 for this domain
+  --server-name <fqdn>        Override local tls.server_name and auto-issue ACME for it
+  --cert-file <path>          Use an existing certificate file and disable ACME
+  --key-file <path>           Use an existing private key file and disable ACME
   --acme-email <mailbox>      Contact email for ACME account registration
-  --server-name <fqdn>        Write local tls.server_name; overrides panel value at runtime
   --dns-resolver <value>      Outbound DNS: system or a custom nameserver like 1.1.1.1
   --ip-strategy <value>       Outbound IP order: system, prefer_ipv4, prefer_ipv6
   --acme-challenge-listen <addr>
@@ -73,6 +71,8 @@ Options:
 
 Examples:
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1
+  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --server-name node.example.com
+  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --cert-file /path/fullchain.pem --key-file /path/privkey.pem
   bash install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 171 --uninstall
   bash install.sh --uninstall --all
@@ -94,8 +94,7 @@ require_linux() {
 }
 
 normalize_paths() {
-  CERT_PATH="${CONFIG_DIR%/}/cert.pem"
-  KEY_PATH="${CONFIG_DIR%/}/key.pem"
+  :
 }
 
 parse_args() {
@@ -135,12 +134,12 @@ parse_args() {
         TARGET_NODE_IDS+=("$4")
         shift 4
         ;;
-      --self-signed-domain)
-        SELF_SIGNED_DOMAIN="$2"
+      --cert-file)
+        CERT_PATH="$2"
         shift 2
         ;;
-      --acme-domain)
-        ACME_DOMAIN="$2"
+      --key-file)
+        KEY_PATH="$2"
         shift 2
         ;;
       --acme-email)
@@ -197,9 +196,19 @@ validate_args() {
     XBOARD_SPECS+=("$PANEL_URL|$PANEL_TOKEN|$PANEL_NODE_ID")
   fi
 
-  if [[ -n "$SELF_SIGNED_DOMAIN" && -n "$ACME_DOMAIN" ]]; then
-    echo "--self-signed-domain and --acme-domain are mutually exclusive." >&2
-    exit 1
+  if [[ -n "$CERT_PATH" || -n "$KEY_PATH" ]]; then
+    if [[ -z "$CERT_PATH" || -z "$KEY_PATH" ]]; then
+      echo "--cert-file and --key-file must be provided together." >&2
+      exit 1
+    fi
+    if [[ ! -f "$CERT_PATH" ]]; then
+      echo "Certificate file not found: $CERT_PATH" >&2
+      exit 1
+    fi
+    if [[ ! -f "$KEY_PATH" ]]; then
+      echo "Private key file not found: $KEY_PATH" >&2
+      exit 1
+    fi
   fi
 
   if [[ "$UNINSTALL" -eq 1 ]]; then
@@ -209,6 +218,18 @@ validate_args() {
   if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
     echo "At least one node is required; pass --panel-url/--panel-token/--node-id or --xboard." >&2
     exit 1
+  fi
+
+  if [[ ${#XBOARD_SPECS[@]} -gt 1 && -n "$TLS_SERVER_NAME" ]]; then
+    echo "--server-name applies to every node in this install invocation." >&2
+  fi
+
+  if [[ ${#XBOARD_SPECS[@]} -gt 1 && ( -n "$CERT_PATH" || -n "$KEY_PATH" ) ]]; then
+    echo "--cert-file/--key-file apply to every node in this install invocation." >&2
+  fi
+
+  if [[ -n "$TLS_SERVER_NAME" && ( -n "$CERT_PATH" || -n "$KEY_PATH" ) ]]; then
+    echo "--server-name only affects local SNI when using --cert-file/--key-file; ACME stays disabled." >&2
   fi
 }
 
@@ -313,37 +334,6 @@ render_config_file() {
     "$template_path" > "$target_path"
 }
 
-generate_self_signed_certificate() {
-  local domain cert_path key_path
-  domain="$1"
-  cert_path="$2"
-  key_path="$3"
-
-  [[ -n "$domain" ]] || {
-    echo "Cannot generate self-signed certificate without a domain." >&2
-    exit 1
-  }
-  if [[ -f "$cert_path" && -f "$key_path" ]]; then
-    echo "TLS files already exist for $domain, skipping self-signed generation." >&2
-    return 0
-  fi
-
-  need_cmd openssl
-  install -d "$(dirname "$cert_path")" "$(dirname "$key_path")"
-  echo "Generating self-signed certificate for $domain" >&2
-  if ! openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-      -subj "/CN=$domain" \
-      -addext "subjectAltName=DNS:$domain" \
-      -keyout "$key_path" \
-      -out "$cert_path"; then
-    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-      -subj "/CN=$domain" \
-      -keyout "$key_path" \
-      -out "$cert_path"
-  fi
-  chmod 600 "$key_path"
-}
-
 fetch_remote_server_name() {
   local panel_url panel_token node_id endpoint response http_code response_body server_name
   panel_url="${1%/}"
@@ -371,7 +361,7 @@ fetch_remote_server_name() {
     if [[ -n "$response_body" ]]; then
       echo "Response body: $response_body" >&2
     fi
-    echo "You can bypass auto-discovery by passing --self-signed-domain or --acme-domain explicitly." >&2
+    echo "You can bypass auto-discovery by passing --server-name explicitly." >&2
     return 1
   fi
   response="$response_body"
@@ -380,11 +370,15 @@ fetch_remote_server_name() {
 }
 
 node_cert_path() {
-  printf '%s\n' "${CONFIG_DIR%/}/cert-${1}.pem"
+  printf '%s\n' "${CONFIG_DIR%/}/acme-cert-${1}.pem"
 }
 
 node_key_path() {
-  printf '%s\n' "${CONFIG_DIR%/}/key-${1}.pem"
+  printf '%s\n' "${CONFIG_DIR%/}/acme-key-${1}.pem"
+}
+
+node_account_key_path() {
+  printf '%s\n' "${CONFIG_DIR%/}/acme-account-${1}.pem"
 }
 
 node_config_path() {
@@ -392,52 +386,39 @@ node_config_path() {
 }
 
 determine_tls_settings() {
-  local panel_url panel_token node_id discovered_domain selected_server_name cert_path key_path
+  local panel_url panel_token node_id discovered_domain selected_server_name cert_path key_path acme_enabled acme_domain account_key_path
   panel_url="$1"
   panel_token="$2"
   node_id="$3"
   selected_server_name="$TLS_SERVER_NAME"
+  account_key_path="$(node_account_key_path "$node_id")"
 
-  if [[ -n "$ACME_DOMAIN" ]]; then
-    if [[ -z "$selected_server_name" ]]; then
-      selected_server_name="$ACME_DOMAIN"
-    fi
-    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
+  if [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]]; then
+    printf '%s|%s|%s|false|node.example.com|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name" "$account_key_path"
     return
   fi
 
-  if [[ -n "$SELF_SIGNED_DOMAIN" ]]; then
-    generate_self_signed_certificate "$SELF_SIGNED_DOMAIN" "$CERT_PATH" "$KEY_PATH"
-    if [[ -z "$selected_server_name" ]]; then
-      selected_server_name="$SELF_SIGNED_DOMAIN"
-    fi
-    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
-    return
-  fi
-
-  if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
-    return
-  fi
-
-  if ! discovered_domain="$(fetch_remote_server_name "$panel_url" "$panel_token" "$node_id")"; then
-    exit 1
-  fi
   if [[ -z "$selected_server_name" ]]; then
+    if ! discovered_domain="$(fetch_remote_server_name "$panel_url" "$panel_token" "$node_id")"; then
+      exit 1
+    fi
     selected_server_name="$discovered_domain"
   fi
+
   [[ -n "$selected_server_name" ]] || {
-    echo "Unable to discover server_name for node $node_id; pass --self-signed-domain or --acme-domain." >&2
+    echo "Unable to discover server_name for node $node_id; pass --server-name explicitly or configure Xboard server_name." >&2
     exit 1
   }
+
   cert_path="$(node_cert_path "$node_id")"
   key_path="$(node_key_path "$node_id")"
-  generate_self_signed_certificate "$selected_server_name" "$cert_path" "$key_path"
-  printf '%s|%s|%s\n' "$cert_path" "$key_path" "$selected_server_name"
+  acme_enabled=true
+  acme_domain="$selected_server_name"
+  printf '%s|%s|%s|%s|%s|%s\n' "$cert_path" "$key_path" "$selected_server_name" "$acme_enabled" "$acme_domain" "$account_key_path"
 }
 
 write_xboard_configs() {
-  local staging_dir template_path spec panel_url panel_token node_id tls_settings cert_path key_path tls_server_name config_path acme_enabled acme_domain account_key_path
+  local staging_dir template_path spec panel_url panel_token node_id tls_settings cert_path key_path tls_server_name config_path acme_enabled acme_domain account_key_path rest
   staging_dir="$1"
   template_path="$staging_dir/config.example.toml"
 
@@ -445,18 +426,16 @@ write_xboard_configs() {
     IFS='|' read -r panel_url panel_token node_id <<<"$spec"
     tls_settings="$(determine_tls_settings "$panel_url" "$panel_token" "$node_id")"
     cert_path="${tls_settings%%|*}"
-    key_path="${tls_settings#*|}"
-    key_path="${key_path%%|*}"
-    tls_server_name="${tls_settings##*|}"
+    rest="${tls_settings#*|}"
+    key_path="${rest%%|*}"
+    rest="${rest#*|}"
+    tls_server_name="${rest%%|*}"
+    rest="${rest#*|}"
+    acme_enabled="${rest%%|*}"
+    rest="${rest#*|}"
+    acme_domain="${rest%%|*}"
+    account_key_path="${rest#*|}"
     config_path="$(node_config_path "$node_id")"
-    if [[ -n "$ACME_DOMAIN" ]]; then
-      acme_enabled=true
-      acme_domain="$ACME_DOMAIN"
-    else
-      acme_enabled=false
-      acme_domain="node.example.com"
-    fi
-    account_key_path="${CONFIG_DIR%/}/acme-account.pem"
     render_config_file \
       "$template_path" \
       "$config_path" \
@@ -540,15 +519,18 @@ stop_disable_unit() {
 }
 
 remove_single_node() {
-  local node_id config_path cert_path key_path unit_name
+  local node_id config_path cert_path key_path legacy_cert_path legacy_key_path account_key_path unit_name
   node_id="$1"
   config_path="$(node_config_path "$node_id")"
   cert_path="$(node_cert_path "$node_id")"
   key_path="$(node_key_path "$node_id")"
+  legacy_cert_path="${CONFIG_DIR%/}/cert-${node_id}.pem"
+  legacy_key_path="${CONFIG_DIR%/}/key-${node_id}.pem"
+  account_key_path="$(node_account_key_path "$node_id")"
   unit_name="${SERVICE_NAME}-${node_id}"
 
   stop_disable_unit "$unit_name"
-  rm -f "$config_path" "$cert_path" "$key_path"
+  rm -f "$config_path" "$cert_path" "$key_path" "$legacy_cert_path" "$legacy_key_path" "$account_key_path"
 }
 
 remove_all_nodes() {
@@ -595,6 +577,7 @@ print_summary() {
 Installed NodeRS-AnyTLS
   Binary: $PREFIX/bin/noders-anytls
   State:  $STATE_DIR
+  TLS:    Auto ACME from local --server-name or Xboard server_name unless --cert-file/--key-file is supplied
 EOF
 
   for config_path in "${GENERATED_CONFIGS[@]}"; do
@@ -603,9 +586,6 @@ EOF
   for service_unit in "${INSTALLED_SERVICES[@]}"; do
     echo "  Service: $service_unit"
   done
-  if [[ -n "$ACME_DOMAIN" ]]; then
-    echo "  ACME:   enabled for $ACME_DOMAIN via HTTP-01 on $ACME_CHALLENGE_LISTEN"
-  fi
 }
 
 install_from_bundle() {

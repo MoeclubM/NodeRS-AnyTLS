@@ -15,6 +15,8 @@ Pure Rust AnyTLS node for Xboard `UniProxy`.
 
 The installer automatically downloads the Linux release package, writes config under `/etc/noders/anytls`, creates the `systemd` service, enables it, and starts it.
 
+By default it tries to fetch the node `server_name` from Xboard and uses it for embedded ACME HTTP-01 certificate issuance.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
   --panel-url https://api.example.com \
@@ -32,28 +34,9 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --xboard https://api.example.com server_token 2
 ```
 
-### Use ACME
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --acme-domain node.example.com \
-  --acme-email admin@example.com
-```
-
-### Use self-signed certificate
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --panel-url https://api.example.com \
-  --panel-token server_token \
-  --node-id 1 \
-  --self-signed-domain node.example.com
-```
-
 ### Override local `server_name`
+
+If you want to force a local SNI instead of using the one from Xboard, pass `--server-name`. This still uses automatic ACME issuance.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
@@ -63,6 +46,19 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --server-name node.example.com
 ```
 
+### Use existing certificate files
+
+If you already have a certificate and key, pass both paths. In this mode the installer writes those paths into the config and does not enable ACME.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token server_token \
+  --node-id 1 \
+  --cert-file /etc/ssl/private/fullchain.pem \
+  --key-file /etc/ssl/private/privkey.pem
+```
+
 ### Set outbound DNS and IP preference
 
 ```bash
@@ -70,7 +66,6 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --panel-url https://api.example.com \
   --panel-token server_token \
   --node-id 1 \
-  --server-name node.example.com \
   --dns-resolver 1.1.1.1 \
   --ip-strategy prefer_ipv6
 ```
@@ -140,13 +135,13 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 ### Upgrade to a specific release
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.8
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.9
 ```
 
 ### Upgrade without restart
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.8 --no-restart
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.9 --no-restart
 ```
 
 ## Uninstall
