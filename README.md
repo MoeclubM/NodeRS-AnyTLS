@@ -186,13 +186,13 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 **Upgrade to a specific release**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.5
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.7
 ```
 
 **Upgrade without restarting services**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.5 --no-restart
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.7 --no-restart
 ```
 
 If a restarted service fails after the new binary is installed, the upgrader restores the previous binary automatically and attempts to restart the previously active services again.

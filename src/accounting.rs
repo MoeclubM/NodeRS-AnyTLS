@@ -18,9 +18,51 @@ pub struct UserEntry {
 }
 
 #[derive(Debug, Default)]
-struct UsageCounter {
-    upload: u64,
-    download: u64,
+pub struct UsageCounter {
+    upload: AtomicU64,
+    download: AtomicU64,
+}
+
+impl UsageCounter {
+    pub fn record_upload(&self, bytes: u64) {
+        if bytes > 0 {
+            self.upload.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_download(&self, bytes: u64) {
+        if bytes > 0 {
+            self.download.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    fn snapshot_if_ready(&self, min_traffic_bytes: u64) -> Option<[u64; 2]> {
+        let upload = self.upload.swap(0, Ordering::AcqRel);
+        let download = self.download.swap(0, Ordering::AcqRel);
+        let total = upload + download;
+        if total == 0 {
+            return None;
+        }
+        if total < min_traffic_bytes {
+            if upload > 0 {
+                self.upload.fetch_add(upload, Ordering::Release);
+            }
+            if download > 0 {
+                self.download.fetch_add(download, Ordering::Release);
+            }
+            return None;
+        }
+        Some([upload, download])
+    }
+
+    fn restore(&self, upload: u64, download: u64) {
+        if upload > 0 {
+            self.upload.fetch_add(upload, Ordering::Release);
+        }
+        if download > 0 {
+            self.download.fetch_add(download, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -84,7 +126,7 @@ impl Drop for SessionLease {
 #[derive(Debug, Default)]
 pub struct Accounting {
     users: RwLock<HashMap<[u8; 32], UserEntry>>,
-    traffic: Mutex<HashMap<i64, UsageCounter>>,
+    traffic: RwLock<HashMap<i64, Arc<UsageCounter>>>,
     online: Mutex<HashMap<i64, HashMap<String, usize>>>,
     external_alive: Mutex<HashMap<i64, usize>>,
     speed_limiters: Mutex<HashMap<i64, Arc<SharedRateLimiter>>>,
@@ -138,10 +180,15 @@ impl Accounting {
             .collect::<HashSet<_>>();
 
         *self.users.write().expect("users lock poisoned") = mapped;
-        self.traffic
-            .lock()
-            .expect("traffic lock poisoned")
-            .retain(|uid, _| valid_ids.contains(uid));
+        {
+            let mut traffic = self.traffic.write().expect("traffic lock poisoned");
+            for user in users {
+                traffic
+                    .entry(user.id)
+                    .or_insert_with(|| Arc::new(UsageCounter::default()));
+            }
+            traffic.retain(|uid, _| valid_ids.contains(uid));
+        }
         self.online
             .lock()
             .expect("online lock poisoned")
@@ -238,31 +285,35 @@ impl Accounting {
         })
     }
 
-    pub fn record_upload(&self, uid: i64, bytes: u64) {
-        if bytes == 0 {
-            return;
+    pub fn traffic_counter(&self, uid: i64) -> Arc<UsageCounter> {
+        if let Some(counter) = self
+            .traffic
+            .read()
+            .expect("traffic lock poisoned")
+            .get(&uid)
+            .cloned()
+        {
+            return counter;
         }
-        let mut guard = self.traffic.lock().expect("traffic lock poisoned");
-        guard.entry(uid).or_default().upload += bytes;
-    }
-
-    pub fn record_download(&self, uid: i64, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        let mut guard = self.traffic.lock().expect("traffic lock poisoned");
-        guard.entry(uid).or_default().download += bytes;
+        let mut guard = self.traffic.write().expect("traffic lock poisoned");
+        guard
+            .entry(uid)
+            .or_insert_with(|| Arc::new(UsageCounter::default()))
+            .clone()
     }
 
     pub fn snapshot_traffic(&self, min_traffic_bytes: u64) -> HashMap<i64, [u64; 2]> {
-        let mut guard = self.traffic.lock().expect("traffic lock poisoned");
+        let counters = self
+            .traffic
+            .read()
+            .expect("traffic lock poisoned")
+            .iter()
+            .map(|(uid, counter)| (*uid, counter.clone()))
+            .collect::<Vec<_>>();
         let mut snapshot = HashMap::new();
-        for (uid, counter) in guard.iter_mut() {
-            let total = counter.upload + counter.download;
-            if total > 0 && total >= min_traffic_bytes {
-                snapshot.insert(*uid, [counter.upload, counter.download]);
-                counter.upload = 0;
-                counter.download = 0;
+        for (uid, counter) in counters {
+            if let Some(usage) = counter.snapshot_if_ready(min_traffic_bytes) {
+                snapshot.insert(uid, usage);
             }
         }
         snapshot
@@ -272,11 +323,8 @@ impl Accounting {
         if traffic.is_empty() {
             return;
         }
-        let mut guard = self.traffic.lock().expect("traffic lock poisoned");
         for (uid, [upload, download]) in traffic {
-            let counter = guard.entry(*uid).or_default();
-            counter.upload += *upload;
-            counter.download += *download;
+            self.traffic_counter(*uid).restore(*upload, *download);
         }
     }
 
@@ -442,8 +490,9 @@ mod tests {
     #[test]
     fn restores_traffic_after_failed_push() {
         let accounting = Accounting::new();
-        accounting.record_upload(1, 100);
-        accounting.record_download(1, 40);
+        let counter = accounting.traffic_counter(1);
+        counter.record_upload(100);
+        counter.record_download(40);
 
         let snapshot = accounting.snapshot_traffic(0);
         assert_eq!(snapshot.get(&1), Some(&[100, 40]));

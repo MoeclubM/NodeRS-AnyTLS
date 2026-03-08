@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use crate::accounting::Accounting;
+use crate::accounting::{Accounting, UsageCounter};
 
 #[derive(Clone)]
 pub struct TrafficRecorder {
-    accounting: Arc<Accounting>,
-    uid: i64,
+    counter: Arc<UsageCounter>,
     direction: TrafficDirection,
 }
 
@@ -18,24 +17,22 @@ enum TrafficDirection {
 impl TrafficRecorder {
     pub fn upload(accounting: Arc<Accounting>, uid: i64) -> Self {
         Self {
-            accounting,
-            uid,
+            counter: accounting.traffic_counter(uid),
             direction: TrafficDirection::Upload,
         }
     }
 
     pub fn download(accounting: Arc<Accounting>, uid: i64) -> Self {
         Self {
-            accounting,
-            uid,
+            counter: accounting.traffic_counter(uid),
             direction: TrafficDirection::Download,
         }
     }
 
     pub fn record(&self, bytes: u64) {
         match self.direction {
-            TrafficDirection::Upload => self.accounting.record_upload(self.uid, bytes),
-            TrafficDirection::Download => self.accounting.record_download(self.uid, bytes),
+            TrafficDirection::Upload => self.counter.record_upload(bytes),
+            TrafficDirection::Download => self.counter.record_download(bytes),
         }
     }
 }

@@ -36,8 +36,8 @@ Options:
 
 Examples:
   bash upgrade.sh
-  bash upgrade.sh --version v0.0.5
-  bash upgrade.sh --version v0.0.5 --no-restart
+  bash upgrade.sh --version v0.0.7
+  bash upgrade.sh --version v0.0.7 --no-restart
 EOF
 }
 

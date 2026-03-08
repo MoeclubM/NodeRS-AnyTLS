@@ -2,12 +2,14 @@ use anyhow::{Context, anyhow, bail};
 use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, split,
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf, split,
 };
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -56,7 +58,7 @@ pub async fn serve_connection(
         route_rules,
         outbound,
         reader: Mutex::new(reader),
-        writer: Arc::new(Mutex::new(writer)),
+        writer: FrameWriter::spawn(writer),
         state: Arc::new(Mutex::new(SessionState::default())),
     };
     let result = session.run().await;
@@ -99,7 +101,7 @@ struct Session {
     route_rules: RouteRules,
     outbound: OutboundConfig,
     reader: Mutex<ReadHalf<TlsStream>>,
-    writer: Arc<Mutex<WriteHalf<TlsStream>>>,
+    writer: FrameWriter,
     state: Arc<Mutex<SessionState>>,
 }
 
@@ -111,18 +113,36 @@ struct SessionState {
 }
 
 struct StreamState {
-    inbound: Arc<Mutex<WriteHalf<DuplexStream>>>,
-    outbound_task: JoinHandle<()>,
+    inbound: Option<mpsc::Sender<InboundMessage>>,
+    task: JoinHandle<()>,
 }
 
-struct StreamOutcome {
-    established: bool,
-    result: anyhow::Result<()>,
+#[derive(Clone)]
+struct FrameWriter {
+    tx: mpsc::Sender<FrameMessage>,
+}
+
+struct FrameMessage {
+    cmd: u8,
+    stream_id: u32,
+    payload: Vec<u8>,
+}
+
+enum InboundMessage {
+    Data(Vec<u8>),
+    Fin,
+}
+
+struct ChannelReader {
+    rx: mpsc::Receiver<InboundMessage>,
+    current: Vec<u8>,
+    offset: usize,
+    finished: bool,
 }
 
 #[derive(Clone)]
 struct StreamContext {
-    writer: Arc<Mutex<WriteHalf<TlsStream>>>,
+    writer: FrameWriter,
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
@@ -130,6 +150,90 @@ struct StreamContext {
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
     send_synack: bool,
+}
+
+struct TcpStreamContext {
+    writer: FrameWriter,
+    stream_id: u32,
+    control: Arc<SessionControl>,
+    limiter: Option<Arc<SharedRateLimiter>>,
+    upload_traffic: TrafficRecorder,
+    download_traffic: TrafficRecorder,
+}
+
+impl FrameWriter {
+    fn spawn(writer: WriteHalf<TlsStream>) -> Self {
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            if let Err(error) = frame_writer_loop(writer, rx).await {
+                debug!(%error, "session writer loop exited with error");
+            }
+        });
+        Self { tx }
+    }
+
+    async fn send(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
+        if payload.len() > u16::MAX as usize {
+            bail!("payload too large: {}", payload.len());
+        }
+        self.tx
+            .send(FrameMessage {
+                cmd,
+                stream_id,
+                payload: payload.to_vec(),
+            })
+            .await
+            .map_err(|_| anyhow!("session writer closed"))
+    }
+}
+
+impl ChannelReader {
+    fn new(rx: mpsc::Receiver<InboundMessage>) -> Self {
+        Self {
+            rx,
+            current: Vec::new(),
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+impl AsyncRead for ChannelReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if self.offset < self.current.len() {
+                let remaining = &self.current[self.offset..];
+                let to_copy = remaining.len().min(buf.remaining());
+                buf.put_slice(&remaining[..to_copy]);
+                self.offset += to_copy;
+                if self.offset >= self.current.len() {
+                    self.current.clear();
+                    self.offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.finished {
+                return Poll::Ready(Ok(()));
+            }
+
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(InboundMessage::Data(chunk))) => {
+                    self.current = chunk;
+                    self.offset = 0;
+                }
+                Poll::Ready(Some(InboundMessage::Fin)) | Poll::Ready(None) => {
+                    self.finished = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
 }
 
 impl Session {
@@ -178,7 +282,7 @@ impl Session {
             std::mem::take(&mut state.streams)
         };
         for (_, stream) in streams {
-            stream.outbound_task.abort();
+            stream.task.abort();
         }
     }
 
@@ -196,15 +300,10 @@ impl Session {
             state
                 .streams
                 .get(&header.stream_id)
-                .map(|stream| stream.inbound.clone())
+                .and_then(|stream| stream.inbound.clone())
         };
         if let Some(inbound) = inbound {
-            inbound
-                .lock()
-                .await
-                .write_all(&payload)
-                .await
-                .context("forward PSH payload")?;
+            let _ = inbound.send(InboundMessage::Data(payload)).await;
         }
         Ok(())
     }
@@ -224,26 +323,7 @@ impl Session {
             state.peer_version
         };
 
-        let (session_side, app_side) = tokio::io::duplex(64 * 1024);
-        let (session_reader, session_writer) = split(session_side);
-        let inbound = Arc::new(Mutex::new(session_writer));
-        let writer = self.writer.clone();
-        let control = self.lease.control();
-        let outbound_task = tokio::spawn(async move {
-            if let Err(error) =
-                pump_remote_to_client(session_reader, writer, stream_id, control).await
-            {
-                debug!(%error, stream_id, "stream outbound pump finished with error");
-            }
-        });
-
-        self.state.lock().await.streams.insert(
-            stream_id,
-            StreamState {
-                inbound,
-                outbound_task,
-            },
-        );
+        let (inbound_tx, inbound_rx) = mpsc::channel(256);
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
@@ -260,26 +340,37 @@ impl Session {
             send_synack: peer_version >= 2,
         };
         let state = self.state.clone();
-        tokio::spawn(async move {
-            let outcome = handle_stream(stream_id, app_side, user, context).await;
+        let task = tokio::spawn(async move {
+            let outcome =
+                handle_stream(stream_id, ChannelReader::new(inbound_rx), user, context).await;
 
-            if let Some(stream_state) = state.lock().await.streams.remove(&stream_id)
-                && !outcome.established
-                && !stream_state.outbound_task.is_finished()
-            {
-                stream_state.outbound_task.abort();
-            }
+            let _ = state.lock().await.streams.remove(&stream_id);
 
-            if let Err(error) = outcome.result {
+            if let Err(error) = outcome {
                 warn!(%error, stream_id, "AnyTLS stream handler failed");
             }
         });
+
+        self.state.lock().await.streams.insert(
+            stream_id,
+            StreamState {
+                inbound: Some(inbound_tx),
+                task,
+            },
+        );
         Ok(())
     }
 
     async fn handle_fin(&self, stream_id: u32) {
-        if let Some(state) = self.state.lock().await.streams.remove(&stream_id) {
-            state.outbound_task.abort();
+        let inbound = {
+            let mut state = self.state.lock().await;
+            state
+                .streams
+                .get_mut(&stream_id)
+                .and_then(|stream| stream.inbound.take())
+        };
+        if let Some(inbound) = inbound {
+            let _ = inbound.send(InboundMessage::Fin).await;
         }
     }
 
@@ -377,55 +468,69 @@ struct FrameHeader {
 
 async fn handle_stream(
     stream_id: u32,
-    mut app_side: DuplexStream,
+    mut app_side: ChannelReader,
     user: UserEntry,
     context: StreamContext,
-) -> StreamOutcome {
+) -> anyhow::Result<()> {
     if context.control.is_cancelled() {
-        return StreamOutcome {
-            established: false,
-            result: Err(anyhow!("session cancelled before stream setup")),
-        };
+        return Err(anyhow!("session cancelled before stream setup"));
     }
     let destination = match SocksAddr::read_from(&mut app_side)
         .await
         .context("read target address")
     {
         Ok(destination) => destination,
-        Err(error) => {
-            return StreamOutcome {
-                established: false,
-                result: Err(error),
-            };
-        }
+        Err(error) => return Err(error),
     };
     if let Some(version) = uot::version_for(&destination) {
         let request = match uot::read_request(&mut app_side, version).await {
             Ok(request) => request,
-            Err(error) => {
-                return StreamOutcome {
-                    established: false,
-                    result: Err(error),
-                };
-            }
+            Err(error) => return Err(error),
         };
         let prepared = uot::prepare(request, &context.route_rules, &context.outbound).await;
-        let established = prepared.is_ok();
         let result = async {
             match prepared {
                 Ok(prepared) => {
                     if context.send_synack {
                         write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
                     }
+                    let (session_side, app_bridge_side) = tokio::io::duplex(256 * 1024);
+                    let (mut session_reader, mut session_writer) = split(session_side);
+                    let bridge_control = context.control.clone();
+                    let bridge_task = tokio::spawn(async move {
+                        pump_copy(
+                            &mut app_side,
+                            &mut session_writer,
+                            bridge_control,
+                            None,
+                            None,
+                        )
+                        .await
+                    });
+                    let writer = context.writer.clone();
+                    let pump_control = context.control.clone();
+                    let outbound_task = tokio::spawn(async move {
+                        pump_remote_to_client(
+                            &mut session_reader,
+                            writer,
+                            stream_id,
+                            pump_control,
+                            None,
+                            None,
+                        )
+                        .await
+                    });
                     prepared
                         .run(
-                            app_side,
+                            app_bridge_side,
                             context.control,
                             context.limiter,
                             context.upload_traffic,
                             context.download_traffic,
                         )
                         .await?;
+                    bridge_task.abort();
+                    outbound_task.abort();
                     info!(stream_id, user = %user.uuid, version = ?version, "UOT stream closed");
                     Ok(())
                 }
@@ -444,10 +549,7 @@ async fn handle_stream(
             }
         }
         .await;
-        return StreamOutcome {
-            established,
-            result,
-        };
+        return result;
     }
 
     if context.route_rules.is_blocked(&destination, "tcp") {
@@ -465,10 +567,7 @@ async fn handle_stream(
             Err(error)
         }
         .await;
-        return StreamOutcome {
-            established: false,
-            result,
-        };
+        return result;
     }
 
     let mut remote =
@@ -482,15 +581,15 @@ async fn handle_stream(
                 if context.send_synack {
                     write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
                 }
-                handle_tcp_stream(
-                    app_side,
-                    stream,
-                    context.control,
-                    context.limiter,
-                    context.upload_traffic,
-                    context.download_traffic,
-                )
-                .await
+                let tcp_context = TcpStreamContext {
+                    writer: context.writer.clone(),
+                    stream_id,
+                    control: context.control,
+                    limiter: context.limiter,
+                    upload_traffic: context.upload_traffic,
+                    download_traffic: context.download_traffic,
+                };
+                handle_tcp_stream(app_side, stream, tcp_context).await
             }
             Err(error) => {
                 if context.send_synack {
@@ -508,37 +607,31 @@ async fn handle_stream(
     }
     .await;
 
-    StreamOutcome {
-        established: remote.is_ok(),
-        result: result.map(|(uploaded, downloaded)| {
-            info!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
-        }),
-    }
+    result.map(|(uploaded, downloaded)| {
+        info!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
+    })
 }
 
 async fn handle_tcp_stream(
-    app_side: DuplexStream,
+    mut app_side: ChannelReader,
     stream: &mut TcpStream,
-    control: Arc<SessionControl>,
-    limiter: Option<Arc<SharedRateLimiter>>,
-    upload_traffic: TrafficRecorder,
-    download_traffic: TrafficRecorder,
+    context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
-    let (mut read_a, mut write_a) = tokio::io::split(app_side);
     let (mut read_b, mut write_b) = stream.split();
     let upload = pump_copy(
-        &mut read_a,
+        &mut app_side,
         &mut write_b,
-        control.clone(),
-        limiter.clone(),
-        Some(upload_traffic),
+        context.control.clone(),
+        context.limiter.clone(),
+        Some(context.upload_traffic),
     );
-    let download = pump_copy(
+    let download = pump_remote_to_client(
         &mut read_b,
-        &mut write_a,
-        control,
-        limiter,
-        Some(download_traffic),
+        context.writer,
+        context.stream_id,
+        context.control,
+        context.limiter,
+        Some(context.download_traffic),
     );
     tokio::try_join!(upload, download)
 }
@@ -554,7 +647,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 16 * 1024];
+    let mut buffer = vec![0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
         if control.is_cancelled() {
@@ -588,49 +681,79 @@ where
     }
 }
 
-async fn pump_remote_to_client(
-    mut session_reader: ReadHalf<DuplexStream>,
-    writer: Arc<Mutex<WriteHalf<TlsStream>>>,
+async fn pump_remote_to_client<R>(
+    reader: &mut R,
+    writer: FrameWriter,
     stream_id: u32,
     control: Arc<SessionControl>,
-) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; 16 * 1024];
+    limiter: Option<Arc<SharedRateLimiter>>,
+    traffic: Option<TrafficRecorder>,
+) -> anyhow::Result<u64>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
     loop {
         if control.is_cancelled() {
-            return Ok(());
+            return Ok(total);
         }
         let read = tokio::select! {
-            _ = control.cancelled() => return Ok(()),
-            read = session_reader.read(&mut buffer) => read?,
+            _ = control.cancelled() => return Ok(total),
+            read = reader.read(&mut buffer) => read?,
         };
         if read == 0 {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
-            return Ok(());
+            return Ok(total);
+        }
+        if let Some(limiter) = &limiter {
+            limiter.consume(read).await;
+            if control.is_cancelled() {
+                return Ok(total);
+            }
         }
         write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).await?;
+        let transferred = read as u64;
+        total += transferred;
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.record(transferred);
+        }
     }
 }
 
 async fn write_frame(
-    writer: &Arc<Mutex<WriteHalf<TlsStream>>>,
+    writer: &FrameWriter,
     cmd: u8,
     stream_id: u32,
     payload: &[u8],
 ) -> anyhow::Result<()> {
-    if payload.len() > u16::MAX as usize {
-        bail!("payload too large: {}", payload.len());
+    writer.send(cmd, stream_id, payload).await
+}
+
+async fn frame_writer_loop(
+    mut writer: WriteHalf<TlsStream>,
+    mut rx: mpsc::Receiver<FrameMessage>,
+) -> anyhow::Result<()> {
+    while let Some(frame) = rx.recv().await {
+        let payload_len = frame.payload.len();
+        if payload_len > u16::MAX as usize {
+            bail!("payload too large: {payload_len}");
+        }
+        let mut header = [0u8; 7];
+        header[0] = frame.cmd;
+        header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
+        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
+        writer
+            .write_all(&header)
+            .await
+            .context("write session frame header")?;
+        if !frame.payload.is_empty() {
+            writer
+                .write_all(&frame.payload)
+                .await
+                .context("write session frame payload")?;
+        }
     }
-    let mut frame = Vec::with_capacity(7 + payload.len());
-    frame.push(cmd);
-    frame.extend_from_slice(&stream_id.to_be_bytes());
-    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    frame.extend_from_slice(payload);
-    let mut writer = writer.lock().await;
-    writer
-        .write_all(&frame)
-        .await
-        .context("write session frame")?;
-    writer.flush().await.context("flush session frame")?;
     Ok(())
 }
 
