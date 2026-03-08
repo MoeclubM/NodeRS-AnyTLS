@@ -1,35 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+REPOSITORY="MoeclubM/NodeRS-AnyTLS"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
 STATE_DIR="/var/lib/noders/anytls"
 SERVICE_NAME="noders-anytls"
 SERVICE_USER="noders-anytls"
+VERSION="latest"
 SELF_SIGNED_DOMAIN=""
 ACME_DOMAIN=""
 ACME_EMAIL=""
 ACME_CHALLENGE_LISTEN="0.0.0.0:80"
 NO_SERVICE=0
+UNINSTALL=0
+REMOVE_ALL=0
 CERT_PATH=""
 KEY_PATH=""
 PANEL_URL=""
 PANEL_TOKEN=""
 PANEL_NODE_ID=""
+TMP_ROOT=""
 declare -a XBOARD_SPECS=()
 declare -a GENERATED_CONFIGS=()
 declare -a INSTALLED_SERVICES=()
+declare -a TARGET_NODE_IDS=()
+
+cleanup() {
+  if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" ]]; then
+    rm -rf "$TMP_ROOT"
+  fi
+}
+trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
 Usage: install.sh [options]
 
-This installer is for Linux release packages only. Run it from the unpacked
-release directory that already contains `noders-anytls`, `config.example.toml`
-and `packaging/systemd/noders-anytls.service`.
+Install mode:
+  The script can run directly from the repo/raw URL and will download the Linux
+  release bundle automatically. If it is already running inside an unpacked
+  release bundle, it installs from local files without downloading again.
+
+Uninstall mode:
+  Pass `--uninstall` to remove one node or the whole installation.
 
 Options:
+  --version <tag>             Release tag to install, default: latest
   --prefix <path>             Binary installation prefix, default: /usr/local
   --config-dir <path>         Config directory, default: /etc/noders/anytls
   --state-dir <path>          Working directory, default: /var/lib/noders/anytls
@@ -42,14 +60,16 @@ Options:
   --acme-email <mailbox>      Contact email for ACME account registration
   --acme-challenge-listen <addr>
                               HTTP-01 listener address, default: 0.0.0.0:80
+  --uninstall                 Remove installed service(s), binary, and related files
+  --all                       Used with --uninstall to remove all nodes and all data
   --no-service                Skip systemd service installation
   -h, --help                  Show this help message
 
 Examples:
-  ./install.sh --panel-url https://api.example.com --panel-token token --node-id 1
-  ./install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
-  ./install.sh --xboard https://api.example.com token 1 --self-signed-domain node.example.com
-  ./install.sh --xboard https://api.example.com token 1 --acme-domain node.example.com --acme-email admin@example.com
+  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1
+  bash install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
+  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 171 --uninstall
+  bash install.sh --uninstall --all
 EOF
 }
 
@@ -62,7 +82,7 @@ need_cmd() {
 
 require_linux() {
   if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "This installer only supports Linux release packages." >&2
+    echo "This installer only supports Linux." >&2
     exit 1
   fi
 }
@@ -75,6 +95,10 @@ normalize_paths() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --version)
+        VERSION="$2"
+        shift 2
+        ;;
       --prefix)
         PREFIX="$2"
         shift 2
@@ -97,10 +121,12 @@ parse_args() {
         ;;
       --node-id)
         PANEL_NODE_ID="$2"
+        TARGET_NODE_IDS+=("$2")
         shift 2
         ;;
       --xboard)
         XBOARD_SPECS+=("$2|$3|$4")
+        TARGET_NODE_IDS+=("$4")
         shift 4
         ;;
       --self-signed-domain)
@@ -118,6 +144,14 @@ parse_args() {
       --acme-challenge-listen)
         ACME_CHALLENGE_LISTEN="$2"
         shift 2
+        ;;
+      --uninstall)
+        UNINSTALL=1
+        shift
+        ;;
+      --all)
+        REMOVE_ALL=1
+        shift
         ;;
       --no-service)
         NO_SERVICE=1
@@ -149,13 +183,64 @@ validate_args() {
     echo "--self-signed-domain and --acme-domain are mutually exclusive." >&2
     exit 1
   fi
+
+  if [[ "$UNINSTALL" -eq 1 ]]; then
+    return
+  fi
+
+  if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
+    echo "At least one node is required; pass --panel-url/--panel-token/--node-id or --xboard." >&2
+    exit 1
+  fi
 }
 
-find_local_staging() {
-  [[ -f "$SCRIPT_DIR/noders-anytls" ]] || return 1
-  [[ -f "$SCRIPT_DIR/config.example.toml" ]] || return 1
-  [[ -f "$SCRIPT_DIR/packaging/systemd/noders-anytls.service" ]] || return 1
-  printf '%s\n' "$SCRIPT_DIR"
+release_layout_present() {
+  [[ -f "$SCRIPT_DIR/noders-anytls" ]] &&
+  [[ -f "$SCRIPT_DIR/config.example.toml" ]] &&
+  [[ -f "$SCRIPT_DIR/packaging/systemd/noders-anytls.service" ]]
+}
+
+resolve_release_tag() {
+  if [[ "$VERSION" != "latest" ]]; then
+    printf '%s\n' "$VERSION"
+    return
+  fi
+  need_cmd curl
+  local tag
+  tag="$(curl -fsSL "https://api.github.com/repos/$REPOSITORY/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+  [[ -n "$tag" ]] || {
+    echo "Unable to detect the latest release tag for $REPOSITORY" >&2
+    exit 1
+  }
+  printf '%s\n' "$tag"
+}
+
+bootstrap_release() {
+  need_cmd curl
+  need_cmd tar
+
+  local tag package_name archive_path package_root bootstrap_args
+  tag="$(resolve_release_tag)"
+  package_name="noders-anytls-${tag}-linux-amd64"
+  TMP_ROOT="$(mktemp -d)"
+  archive_path="$TMP_ROOT/${package_name}.tar.gz"
+
+  echo "Downloading ${package_name}.tar.gz from GitHub Release ${tag}"
+  curl -fL -o "$archive_path" "https://github.com/${REPOSITORY}/releases/download/${tag}/${package_name}.tar.gz"
+  tar -xzf "$archive_path" -C "$TMP_ROOT"
+  package_root="$TMP_ROOT/$package_name"
+  [[ -d "$package_root" ]] || {
+    echo "Release package layout is invalid: $package_root not found" >&2
+    exit 1
+  }
+
+  bootstrap_args=()
+  while [[ $# -gt 0 ]]; do
+    bootstrap_args+=("$1")
+    shift
+  done
+
+  "$package_root/install.sh" "${bootstrap_args[@]}"
 }
 
 ensure_directories() {
@@ -217,6 +302,7 @@ generate_self_signed_certificate() {
     echo "TLS files already exist for $domain, skipping self-signed generation."
     return 0
   fi
+
   need_cmd openssl
   install -d "$(dirname "$cert_path")" "$(dirname "$key_path")"
   echo "Generating self-signed certificate for $domain"
@@ -290,36 +376,6 @@ determine_tls_paths() {
   }
   generate_self_signed_certificate "$discovered_domain" "$(node_cert_path "$node_id")" "$(node_key_path "$node_id")"
   printf '%s|%s\n' "$(node_cert_path "$node_id")" "$(node_key_path "$node_id")"
-}
-
-write_default_config() {
-  local staging_dir template_path acme_enabled acme_domain account_key_path cert_path key_path
-  staging_dir="$1"
-  template_path="$staging_dir/config.example.toml"
-  cert_path="$CERT_PATH"
-  key_path="$KEY_PATH"
-  if [[ -n "$SELF_SIGNED_DOMAIN" ]]; then
-    generate_self_signed_certificate "$SELF_SIGNED_DOMAIN" "$cert_path" "$key_path"
-  fi
-  if [[ -n "$ACME_DOMAIN" ]]; then
-    acme_enabled=true
-    acme_domain="$ACME_DOMAIN"
-  else
-    acme_enabled=false
-    acme_domain="node.example.com"
-  fi
-  account_key_path="${CONFIG_DIR%/}/acme-account.pem"
-  render_config_file \
-    "$template_path" \
-    "$CONFIG_DIR/config.toml" \
-    "https://xboard.example.com" \
-    "replace-me" \
-    "1" \
-    "$cert_path" \
-    "$key_path" \
-    "$acme_enabled" \
-    "$acme_domain" \
-    "$account_key_path"
 }
 
 write_xboard_configs() {
@@ -397,15 +453,6 @@ install_service() {
   fi
   chown -R "$SERVICE_USER":"$SERVICE_USER" "$STATE_DIR" "$CONFIG_DIR"
 
-  if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
-    unit_path="/etc/systemd/system/${SERVICE_NAME}.service"
-    render_service_file "$staging_dir" "$unit_path" "$CONFIG_DIR/config.toml"
-    systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME"
-    INSTALLED_SERVICES+=("$SERVICE_NAME")
-    return
-  fi
-
   for spec in "${XBOARD_SPECS[@]}"; do
     IFS='|' read -r _ _ node_id <<<"$spec"
     config_path="$(node_config_path "$node_id")"
@@ -417,8 +464,68 @@ install_service() {
 
   systemctl daemon-reload
   for service_unit in "${INSTALLED_SERVICES[@]}"; do
-    systemctl enable --now "$service_unit"
+    systemctl enable "$service_unit" >/dev/null 2>&1 || true
+    systemctl restart "$service_unit" >/dev/null 2>&1 || systemctl start "$service_unit"
   done
+}
+
+stop_disable_unit() {
+  local unit_name
+  unit_name="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+  fi
+  rm -f "/etc/systemd/system/${unit_name}.service"
+}
+
+remove_single_node() {
+  local node_id config_path cert_path key_path unit_name
+  node_id="$1"
+  config_path="$(node_config_path "$node_id")"
+  cert_path="$(node_cert_path "$node_id")"
+  key_path="$(node_key_path "$node_id")"
+  unit_name="${SERVICE_NAME}-${node_id}"
+
+  stop_disable_unit "$unit_name"
+  rm -f "$config_path" "$cert_path" "$key_path"
+}
+
+remove_all_nodes() {
+  local unit_path unit_name
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit_path in /etc/systemd/system/${SERVICE_NAME}.service /etc/systemd/system/${SERVICE_NAME}-*.service; do
+      [[ -e "$unit_path" ]] || continue
+      unit_name="$(basename "$unit_path" .service)"
+      systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+      rm -f "$unit_path"
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$PREFIX/bin/noders-anytls"
+  rm -rf "$CONFIG_DIR" "$STATE_DIR"
+  if id "$SERVICE_USER" >/dev/null 2>&1; then
+    userdel "$SERVICE_USER" >/dev/null 2>&1 || true
+  fi
+}
+
+uninstall() {
+  require_linux
+  normalize_paths
+
+  if [[ "$REMOVE_ALL" -eq 1 || ${#TARGET_NODE_IDS[@]} -eq 0 ]]; then
+    remove_all_nodes
+    echo "Removed all NodeRS-AnyTLS nodes, configs, services, and binary."
+    return
+  fi
+
+  for node_id in "${TARGET_NODE_IDS[@]}"; do
+    remove_single_node "$node_id"
+    echo "Removed node ${node_id}."
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
 }
 
 print_summary() {
@@ -429,16 +536,9 @@ Installed NodeRS-AnyTLS
   State:  $STATE_DIR
 EOF
 
-  if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
-    echo "  Config: $CONFIG_DIR/config.toml"
-    echo "  Cert:   $CERT_PATH"
-    echo "  Key:    $KEY_PATH"
-  else
-    for config_path in "${GENERATED_CONFIGS[@]}"; do
-      echo "  Config: $config_path"
-    done
-  fi
-
+  for config_path in "${GENERATED_CONFIGS[@]}"; do
+    echo "  Config: $config_path"
+  done
   for service_unit in "${INSTALLED_SERVICES[@]}"; do
     echo "  Service: $service_unit"
   done
@@ -447,31 +547,35 @@ EOF
   fi
 }
 
-main() {
-  parse_args "$@"
-  validate_args
-  require_linux
-  normalize_paths
-
+install_from_bundle() {
   local staging_dir
-  staging_dir="$(find_local_staging)" || {
-    echo "Release package files not found next to install.sh. Use the unpacked Linux release bundle." >&2
-    exit 1
-  }
+  staging_dir="$1"
 
   ensure_directories
   install -m 0755 "$staging_dir/noders-anytls" "$PREFIX/bin/noders-anytls"
-
-  if [[ ${#XBOARD_SPECS[@]} -eq 0 ]]; then
-    if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
-      write_default_config "$staging_dir"
-    fi
-  else
-    write_xboard_configs "$staging_dir"
-  fi
-
+  write_xboard_configs "$staging_dir"
   install_service "$staging_dir"
   print_summary
+}
+
+main() {
+  parse_args "$@"
+  validate_args
+
+  if [[ "$UNINSTALL" -eq 1 ]]; then
+    uninstall
+    return
+  fi
+
+  require_linux
+  normalize_paths
+
+  if ! release_layout_present; then
+    bootstrap_release "$@"
+    return
+  fi
+
+  install_from_bundle "$SCRIPT_DIR"
 }
 
 main "$@"

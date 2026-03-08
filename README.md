@@ -78,14 +78,46 @@ Each archive contains:
 
 ### Linux
 
-Use the packaged `install.sh` from the unpacked Linux release bundle:
+The Linux installer supports two modes:
+
+- Run directly from the repository/raw URL: it auto-downloads the latest Linux release bundle and installs it
+- Run from an unpacked Linux release bundle: it installs from the local release files directly
+
+Services are enabled and started automatically during installation when the script runs as `root` on a `systemd` host. No extra `systemctl start` command is required.
+
+**One-line install**
 
 ```bash
-./install.sh
-./install.sh --panel-url https://api.example.com --panel-token token --node-id 1
-./install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
-./install.sh --self-signed-domain node.example.com
-./install.sh --acme-domain node.example.com --acme-email admin@example.com
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --panel-url https://api.example.com --panel-token token --node-id 1
+```
+
+**Multiple nodes**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --xboard https://api.example.com tokenA 1 \
+  --xboard https://api.example.com tokenB 2
+```
+
+**ACME**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token token \
+  --node-id 1 \
+  --acme-domain node.example.com \
+  --acme-email admin@example.com
+```
+
+**Self-signed**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token token \
+  --node-id 1 \
+  --self-signed-domain node.example.com
 ```
 
 Default install paths:
@@ -98,7 +130,25 @@ Default install paths:
 
 When `--xboard` is repeated, the installer creates one config per node under `/etc/noders/anytls/nodes/<node_id>.toml` and one service per node named `noders-anytls-<node_id>`.
 
-When running as root on a systemd host, the script also installs and starts the corresponding `systemd` service or services.
+When running as root on a systemd host, the script installs, enables, and starts the corresponding `systemd` service or services automatically.
 
 If `--acme-domain` is used, the installer enables `[tls.acme]` in `config.toml` and skips self-signed generation.
 If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer tries to fetch `server_name` from Xboard and auto-generates a per-node self-signed certificate when no certificate already exists.
+
+### Uninstall
+
+**Remove one node**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --uninstall --node-id 171
+```
+
+**Remove everything**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --uninstall --all
+```
+
+`--uninstall --node-id <id>` removes the corresponding `noders-anytls-<id>` service, node config, and per-node certificate files.
+
+`--uninstall --all` removes all `noders-anytls-*` services, `/etc/noders/anytls`, `/var/lib/noders/anytls`, and `/usr/local/bin/noders-anytls`.
