@@ -7,6 +7,7 @@ use tokio::time::sleep;
 
 use crate::config::{IpStrategy, OutboundConfig};
 
+use super::configure_tcp_stream;
 use super::dns;
 use super::rules::RouteRules;
 use super::socksaddr::SocksAddr;
@@ -86,7 +87,7 @@ pub async fn resolve_destination(
 
 async fn connect_target(target: SocketAddr) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect(target).await?;
-    let _ = stream.set_nodelay(true);
+    configure_tcp_stream(&stream);
     Ok(stream)
 }
 

@@ -11,12 +11,14 @@ use tokio::io::{
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::config::OutboundConfig;
 use crate::limiter::SharedRateLimiter;
 
+use super::activity::{ActivityTracker, HEARTBEAT_INTERVAL, SESSION_IDLE_TIMEOUT};
 use super::padding::PaddingScheme;
 use super::rules::RouteRules;
 use super::socksaddr::SocksAddr;
@@ -49,6 +51,7 @@ pub async fn serve_connection(
     let user = authenticate(&mut stream, &accounting).await?;
     let lease = accounting.open_session(&user, source)?;
     let control = lease.control();
+    let activity = ActivityTracker::new();
     let (reader, writer) = split(stream);
     let session = Session {
         user: user.clone(),
@@ -57,6 +60,7 @@ pub async fn serve_connection(
         padding,
         route_rules,
         outbound,
+        activity,
         reader: Mutex::new(reader),
         writer: FrameWriter::spawn(writer),
         state: Arc::new(Mutex::new(SessionState::default())),
@@ -100,6 +104,7 @@ struct Session {
     padding: PaddingScheme,
     route_rules: RouteRules,
     outbound: OutboundConfig,
+    activity: Arc<ActivityTracker>,
     reader: Mutex<ReadHalf<TlsStream>>,
     writer: FrameWriter,
     state: Arc<Mutex<SessionState>>,
@@ -155,6 +160,7 @@ struct StreamContext {
     limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
     outbound: OutboundConfig,
+    activity: Arc<ActivityTracker>,
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
     send_synack: bool,
@@ -165,6 +171,7 @@ struct TcpStreamContext {
     stream_id: u32,
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
+    activity: Arc<ActivityTracker>,
     upload_traffic: TrafficRecorder,
     download_traffic: TrafficRecorder,
 }
@@ -255,16 +262,30 @@ impl AsyncRead for ChannelReader {
 impl Session {
     async fn run(self) -> anyhow::Result<()> {
         let control = self.lease.control();
+        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
         let result = loop {
             let header = tokio::select! {
                 biased;
                 _ = control.cancelled() => break Err(anyhow!("session cancelled")),
+                _ = heartbeat.tick() => {
+                    let idle_for = self.activity.idle_for();
+                    if idle_for >= SESSION_IDLE_TIMEOUT {
+                        break Err(anyhow!("session idle timeout"));
+                    }
+                    if idle_for >= HEARTBEAT_INTERVAL && self.can_send_heartbeat().await {
+                        self.write_frame(CMD_HEART_REQUEST, 0, &[]).await?;
+                    }
+                    continue;
+                }
                 header = self.read_header() => match header {
                     Ok(header) => header,
                     Err(error) if is_eof(&error) => break Ok(()),
                     Err(error) => break Err(error),
                 }
             };
+            self.activity.record();
             match header.cmd {
                 CMD_PSH => self.handle_psh(header).await?,
                 CMD_SYN => self.handle_syn(header.stream_id).await?,
@@ -290,6 +311,10 @@ impl Session {
         };
         self.shutdown().await;
         result
+    }
+
+    async fn can_send_heartbeat(&self) -> bool {
+        self.state.lock().await.received_settings
     }
 
     async fn shutdown(&self) {
@@ -351,6 +376,7 @@ impl Session {
             limiter: self.lease.limiter(),
             route_rules: self.route_rules.clone(),
             outbound: self.outbound.clone(),
+            activity: self.activity.clone(),
             upload_traffic: TrafficRecorder::upload(accounting.clone(), user.id),
             download_traffic: TrafficRecorder::download(accounting, user.id),
             send_synack: peer_version >= 2,
@@ -520,11 +546,13 @@ async fn handle_stream(
                             bridge_control,
                             None,
                             None,
+                            None,
                         )
                         .await
                     });
                     let writer = context.writer.clone();
                     let pump_control = context.control.clone();
+                    let pump_activity = context.activity.clone();
                     let outbound_task = tokio::spawn(async move {
                         pump_remote_to_client(
                             &mut session_reader,
@@ -533,6 +561,7 @@ async fn handle_stream(
                             pump_control,
                             None,
                             None,
+                            Some(pump_activity),
                         )
                         .await
                     });
@@ -602,6 +631,7 @@ async fn handle_stream(
                     stream_id,
                     control: context.control,
                     limiter: context.limiter,
+                    activity: context.activity,
                     upload_traffic: context.upload_traffic,
                     download_traffic: context.download_traffic,
                 };
@@ -640,6 +670,7 @@ async fn handle_tcp_stream(
         context.control.clone(),
         context.limiter.clone(),
         Some(context.upload_traffic),
+        None,
     );
     let download = pump_remote_to_client(
         &mut read_b,
@@ -648,6 +679,7 @@ async fn handle_tcp_stream(
         context.control,
         context.limiter,
         Some(context.download_traffic),
+        Some(context.activity),
     );
     tokio::try_join!(upload, download)
 }
@@ -658,6 +690,7 @@ async fn pump_copy<R, W>(
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
     traffic: Option<TrafficRecorder>,
+    activity: Option<Arc<ActivityTracker>>,
 ) -> anyhow::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -694,6 +727,9 @@ where
         if let Some(traffic) = traffic.as_ref() {
             traffic.record(transferred);
         }
+        if let Some(activity) = activity.as_ref() {
+            activity.record();
+        }
     }
 }
 
@@ -704,6 +740,7 @@ async fn pump_remote_to_client<R>(
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
     traffic: Option<TrafficRecorder>,
+    activity: Option<Arc<ActivityTracker>>,
 ) -> anyhow::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -733,6 +770,9 @@ where
         total += transferred;
         if let Some(traffic) = traffic.as_ref() {
             traffic.record(transferred);
+        }
+        if let Some(activity) = activity.as_ref() {
+            activity.record();
         }
     }
 }
@@ -874,6 +914,7 @@ mod tests {
                     control,
                     None,
                     Some(TrafficRecorder::upload(accounting, 7)),
+                    None,
                 )
                 .await
             }

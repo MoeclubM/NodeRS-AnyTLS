@@ -1,3 +1,4 @@
+mod activity;
 mod dns;
 mod padding;
 mod rules;
@@ -9,12 +10,13 @@ mod transport;
 mod uot;
 
 use anyhow::Context;
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 
 use crate::accounting::Accounting;
@@ -23,6 +25,9 @@ use crate::panel::{NodeConfigResponse, RouteConfig};
 
 use self::padding::PaddingScheme;
 use self::rules::RouteRules;
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveNodeConfig {
@@ -264,7 +269,7 @@ async fn accept_loop(
                 continue;
             }
         };
-        let _ = stream.set_nodelay(true);
+        configure_tcp_stream(&stream);
         let acceptor = {
             let tls_config = tls_config.read().expect("tls config lock poisoned").clone();
             tokio_rustls::TlsAcceptor::from(tls_config)
@@ -274,10 +279,14 @@ async fn accept_loop(
         let padding_scheme = padding_scheme.clone();
         let route_rules = route_rules.clone();
         tokio::spawn(async move {
-            let tls_stream = match acceptor.accept(stream).await {
-                Ok(stream) => stream,
-                Err(error) => {
+            let tls_stream = match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
                     warn!(%error, %source, "TLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(%source, "TLS handshake timed out");
                     return;
                 }
             };
@@ -303,6 +312,13 @@ async fn accept_loop(
             }
         });
     }
+}
+
+pub(super) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    let socket = SockRef::from(stream);
+    let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
 fn bind_listeners(listen_ip: &str, port: u16) -> anyhow::Result<Vec<TcpListener>> {
