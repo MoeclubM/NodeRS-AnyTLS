@@ -156,7 +156,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 Default install paths:
 
 - Binary: `/usr/local/bin/noders-anytls`
-- Config: `/etc/noders/anytls/config.toml`
+- Config directory: `/etc/noders/anytls`
 - State: `/var/lib/noders/anytls`
 - Cert: `/etc/noders/anytls/cert.pem`
 - Key: `/etc/noders/anytls/key.pem`
@@ -167,7 +167,7 @@ When running as root on a systemd host, the script installs, enables, and starts
 
 `--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`, not a per-user token and not a subscription token. This is enforced by Xboard in `app/Http/Middleware/Server.php:14`.
 
-If `--acme-domain` is used, the installer enables `[tls.acme]` in `config.toml` and skips self-signed generation.
+If `--acme-domain` is used, the installer enables `[tls.acme]` in each generated node config and skips self-signed generation.
 If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer tries to fetch `server_name` from Xboard and auto-generates a per-node self-signed certificate when no certificate already exists.
 If `--server-name` is passed, the installer writes `tls.server_name` locally and that value takes precedence over the panel response at runtime.
 If `--dns-resolver` is set to `system`, the node uses the system resolver; any other value is treated as a custom nameserver. `--ip-strategy` controls address ordering for domain outbound connections.
