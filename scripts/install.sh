@@ -13,6 +13,7 @@ SELF_SIGNED_DOMAIN=""
 ACME_DOMAIN=""
 ACME_EMAIL=""
 ACME_CHALLENGE_LISTEN="0.0.0.0:80"
+TLS_SERVER_NAME=""
 NO_SERVICE=0
 UNINSTALL=0
 REMOVE_ALL=0
@@ -52,12 +53,13 @@ Options:
   --config-dir <path>         Config directory, default: /etc/noders/anytls
   --state-dir <path>          Working directory, default: /var/lib/noders/anytls
   --panel-url <url>           Single-node Xboard API address
-  --panel-token <token>       Single-node Xboard key/token
+  --panel-token <token>       Single-node Xboard server_token
   --node-id <id>              Single-node Xboard node id
   --xboard <url> <token> <id> Add one Xboard node triplet; may be repeated
   --self-signed-domain <fqdn> Generate a self-signed certificate into the config directory
   --acme-domain <fqdn>        Enable embedded ACME HTTP-01 for this domain
   --acme-email <mailbox>      Contact email for ACME account registration
+  --server-name <fqdn>        Write local tls.server_name; overrides panel value at runtime
   --acme-challenge-listen <addr>
                               HTTP-01 listener address, default: 0.0.0.0:80
   --uninstall                 Remove installed service(s), binary, and related files
@@ -139,6 +141,10 @@ parse_args() {
         ;;
       --acme-email)
         ACME_EMAIL="$2"
+        shift 2
+        ;;
+      --server-name)
+        TLS_SERVER_NAME="$2"
         shift 2
         ;;
       --acme-challenge-listen)
@@ -252,7 +258,7 @@ sed_escape() {
 }
 
 render_config_file() {
-  local template_path target_path panel_url panel_token node_id cert_path key_path acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
+  local template_path target_path panel_url panel_token node_id cert_path key_path tls_server_name acme_enabled acme_domain account_key_path escaped_url escaped_token escaped_node_id escaped_cert escaped_key escaped_tls_server_name escaped_acme_domain escaped_acme_email escaped_acme_challenge escaped_account_key
   template_path="$1"
   target_path="$2"
   panel_url="$3"
@@ -260,15 +266,17 @@ render_config_file() {
   node_id="$5"
   cert_path="$6"
   key_path="$7"
-  acme_enabled="$8"
-  acme_domain="$9"
-  account_key_path="${10}"
+  tls_server_name="$8"
+  acme_enabled="$9"
+  acme_domain="${10}"
+  account_key_path="${11}"
 
   escaped_url="$(sed_escape "$panel_url")"
   escaped_token="$(sed_escape "$panel_token")"
   escaped_node_id="$(sed_escape "$node_id")"
   escaped_cert="$(sed_escape "$cert_path")"
   escaped_key="$(sed_escape "$key_path")"
+  escaped_tls_server_name="$(sed_escape "$tls_server_name")"
   escaped_acme_domain="$(sed_escape "$acme_domain")"
   escaped_acme_email="$(sed_escape "$ACME_EMAIL")"
   escaped_acme_challenge="$(sed_escape "$ACME_CHALLENGE_LISTEN")"
@@ -280,6 +288,7 @@ render_config_file() {
     -e "s#node_id = 1#node_id = $escaped_node_id#g" \
     -e "s#cert_path = \"cert.pem\"#cert_path = \"$escaped_cert\"#g" \
     -e "s#key_path = \"key.pem\"#key_path = \"$escaped_key\"#g" \
+    -e "s#server_name = \"\"#server_name = \"$escaped_tls_server_name\"#g" \
     -e "s#enabled = false#enabled = $acme_enabled#g" \
     -e "s#email = \"admin@example.com\"#email = \"$escaped_acme_email\"#g" \
     -e "s#domain = \"node.example.com\"#domain = \"$escaped_acme_domain\"#g" \
@@ -299,13 +308,13 @@ generate_self_signed_certificate() {
     exit 1
   }
   if [[ -f "$cert_path" && -f "$key_path" ]]; then
-    echo "TLS files already exist for $domain, skipping self-signed generation."
+    echo "TLS files already exist for $domain, skipping self-signed generation." >&2
     return 0
   fi
 
   need_cmd openssl
   install -d "$(dirname "$cert_path")" "$(dirname "$key_path")"
-  echo "Generating self-signed certificate for $domain"
+  echo "Generating self-signed certificate for $domain" >&2
   if ! openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
       -subj "/CN=$domain" \
       -addext "subjectAltName=DNS:$domain" \
@@ -320,17 +329,36 @@ generate_self_signed_certificate() {
 }
 
 fetch_remote_server_name() {
-  local panel_url panel_token node_id response server_name
+  local panel_url panel_token node_id endpoint response http_code response_body server_name
   panel_url="${1%/}"
   panel_token="$2"
   node_id="$3"
+  endpoint="$panel_url/api/v1/server/UniProxy/config"
 
   need_cmd curl
-  response="$(curl -fsSL --get \
+  if ! response="$(curl -sSL --get \
+    --write-out $'\n%{http_code}' \
     --data-urlencode "token=$panel_token" \
     --data-urlencode "node_id=$node_id" \
     --data-urlencode "node_type=anytls" \
-    "$panel_url/api/v1/server/UniProxy/config")"
+    "$endpoint")"; then
+    echo "Unable to query $endpoint while discovering server_name." >&2
+    return 1
+  fi
+  http_code="${response##*$'\n'}"
+  response_body="${response%$'\n'*}"
+  if [[ "$http_code" != "200" ]]; then
+    echo "Xboard rejected automatic server_name discovery with HTTP $http_code from $endpoint." >&2
+    if [[ "$http_code" == "403" ]]; then
+      echo "This endpoint requires Xboard's global server_token; make sure --panel-token is admin_setting('server_token'), not a node key or user token." >&2
+    fi
+    if [[ -n "$response_body" ]]; then
+      echo "Response body: $response_body" >&2
+    fi
+    echo "You can bypass auto-discovery by passing --self-signed-domain or --acme-domain explicitly." >&2
+    return 1
+  fi
+  response="$response_body"
   server_name="$(printf '%s' "$response" | tr -d '\n' | sed -n 's/.*"server_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   printf '%s\n' "$server_name"
 }
@@ -347,47 +375,63 @@ node_config_path() {
   printf '%s\n' "${CONFIG_DIR%/}/nodes/${1}.toml"
 }
 
-determine_tls_paths() {
-  local panel_url panel_token node_id discovered_domain
+determine_tls_settings() {
+  local panel_url panel_token node_id discovered_domain selected_server_name cert_path key_path
   panel_url="$1"
   panel_token="$2"
   node_id="$3"
+  selected_server_name="$TLS_SERVER_NAME"
 
   if [[ -n "$ACME_DOMAIN" ]]; then
-    printf '%s|%s\n' "$CERT_PATH" "$KEY_PATH"
+    if [[ -z "$selected_server_name" ]]; then
+      selected_server_name="$ACME_DOMAIN"
+    fi
+    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
     return
   fi
 
   if [[ -n "$SELF_SIGNED_DOMAIN" ]]; then
     generate_self_signed_certificate "$SELF_SIGNED_DOMAIN" "$CERT_PATH" "$KEY_PATH"
-    printf '%s|%s\n' "$CERT_PATH" "$KEY_PATH"
+    if [[ -z "$selected_server_name" ]]; then
+      selected_server_name="$SELF_SIGNED_DOMAIN"
+    fi
+    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
     return
   fi
 
   if [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]]; then
-    printf '%s|%s\n' "$CERT_PATH" "$KEY_PATH"
+    printf '%s|%s|%s\n' "$CERT_PATH" "$KEY_PATH" "$selected_server_name"
     return
   fi
 
-  discovered_domain="$(fetch_remote_server_name "$panel_url" "$panel_token" "$node_id")"
-  [[ -n "$discovered_domain" ]] || {
+  if ! discovered_domain="$(fetch_remote_server_name "$panel_url" "$panel_token" "$node_id")"; then
+    exit 1
+  fi
+  if [[ -z "$selected_server_name" ]]; then
+    selected_server_name="$discovered_domain"
+  fi
+  [[ -n "$selected_server_name" ]] || {
     echo "Unable to discover server_name for node $node_id; pass --self-signed-domain or --acme-domain." >&2
     exit 1
   }
-  generate_self_signed_certificate "$discovered_domain" "$(node_cert_path "$node_id")" "$(node_key_path "$node_id")"
-  printf '%s|%s\n' "$(node_cert_path "$node_id")" "$(node_key_path "$node_id")"
+  cert_path="$(node_cert_path "$node_id")"
+  key_path="$(node_key_path "$node_id")"
+  generate_self_signed_certificate "$selected_server_name" "$cert_path" "$key_path"
+  printf '%s|%s|%s\n' "$cert_path" "$key_path" "$selected_server_name"
 }
 
 write_xboard_configs() {
-  local staging_dir template_path spec panel_url panel_token node_id tls_paths cert_path key_path config_path acme_enabled acme_domain account_key_path
+  local staging_dir template_path spec panel_url panel_token node_id tls_settings cert_path key_path tls_server_name config_path acme_enabled acme_domain account_key_path
   staging_dir="$1"
   template_path="$staging_dir/config.example.toml"
 
   for spec in "${XBOARD_SPECS[@]}"; do
     IFS='|' read -r panel_url panel_token node_id <<<"$spec"
-    tls_paths="$(determine_tls_paths "$panel_url" "$panel_token" "$node_id")"
-    cert_path="${tls_paths%%|*}"
-    key_path="${tls_paths##*|}"
+    tls_settings="$(determine_tls_settings "$panel_url" "$panel_token" "$node_id")"
+    cert_path="${tls_settings%%|*}"
+    key_path="${tls_settings#*|}"
+    key_path="${key_path%%|*}"
+    tls_server_name="${tls_settings##*|}"
     config_path="$(node_config_path "$node_id")"
     if [[ -n "$ACME_DOMAIN" ]]; then
       acme_enabled=true
@@ -405,6 +449,7 @@ write_xboard_configs() {
       "$node_id" \
       "$cert_path" \
       "$key_path" \
+      "$tls_server_name" \
       "$acme_enabled" \
       "$acme_domain" \
       "$account_key_path"

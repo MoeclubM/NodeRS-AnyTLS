@@ -12,6 +12,7 @@ node_type = "anytls"
 [tls]
 cert_path = "cert.pem"
 key_path = "key.pem"
+server_name = ""
 reload_interval_seconds = 60
 
 [tls.acme]

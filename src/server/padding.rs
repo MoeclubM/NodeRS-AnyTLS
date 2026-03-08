@@ -29,17 +29,15 @@ enum PaddingRule {
 
 impl Default for PaddingScheme {
     fn default() -> Self {
-        Self::from_lines(
-            &DEFAULT_SCHEME
-                .iter()
-                .map(|line| line.to_string())
-                .collect::<Vec<_>>(),
-        )
-        .expect("default padding scheme must be valid")
+        Self::from_lines(&Self::default_lines()).expect("default padding scheme must be valid")
     }
 }
 
 impl PaddingScheme {
+    pub fn default_lines() -> Vec<String> {
+        DEFAULT_SCHEME.iter().map(|line| line.to_string()).collect()
+    }
+
     pub fn from_lines(lines: &[String]) -> anyhow::Result<Self> {
         let mut stop = None;
         let mut rules = HashMap::new();
@@ -128,5 +126,13 @@ mod tests {
         let scheme = PaddingScheme::default();
         assert_eq!(scheme.stop(), 8);
         assert!(!scheme.packet_sizes(2).is_empty());
+    }
+
+    #[test]
+    fn exposes_default_lines() {
+        assert_eq!(
+            PaddingScheme::default_lines().first().map(String::as_str),
+            Some("stop=8")
+        );
     }
 }

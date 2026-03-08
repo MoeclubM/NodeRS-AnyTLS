@@ -24,6 +24,7 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 - `uTLS` is an outbound TLS fingerprinting feature in `sing-box_mod`; it does not apply to this inbound node process
 - Server-side AnyTLS padding negotiation is implemented by accepting client preface padding and sending `UPDATE_PADDING_SCHEME` when `padding-md5` mismatches
 - Active record padding generation is a client-side behavior in the upstream AnyTLS reference implementation, so it is intentionally not emitted by this server
+- Local `tls.server_name` takes precedence over panel `server_name`
 - Certificate files are hot-reloaded from disk according to `tls.reload_interval_seconds`
 - Embedded ACME HTTP-01 is implemented in pure Rust under `src/acme.rs`; issued certificates are renewed before expiry and reloaded automatically
 - ACME renewal timing is computed from the current certificate `notAfter` field rather than a fixed timer guess
@@ -53,8 +54,9 @@ DNS routes are applied only to domain targets. IP targets bypass DNS rules.
 
 1. Copy `config.example.toml` to `config.toml`
 2. Fill `panel.url`, `panel.token`, `panel.node_id`, `tls.cert_path`, `tls.key_path`
-3. Optional: enable `[tls.acme]` for built-in HTTP-01 certificate issuance
-4. Run `cargo run --offline -- config.toml`
+3. Optional: set `tls.server_name`; when present it overrides panel `server_name`
+4. Optional: enable `[tls.acme]` for built-in HTTP-01 certificate issuance
+5. Run `cargo run --offline -- config.toml`
 
 ## Release Packaging
 
@@ -88,15 +90,15 @@ Services are enabled and started automatically during installation when the scri
 **One-line install**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --panel-url https://api.example.com --panel-token token --node-id 1
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- --panel-url https://api.example.com --panel-token server_token --node-id 1
 ```
 
 **Multiple nodes**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
-  --xboard https://api.example.com tokenA 1 \
-  --xboard https://api.example.com tokenB 2
+  --xboard https://api.example.com server_token 1 \
+  --xboard https://api.example.com server_token 2
 ```
 
 **ACME**
@@ -104,7 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
   --panel-url https://api.example.com \
-  --panel-token token \
+  --panel-token server_token \
   --node-id 1 \
   --acme-domain node.example.com \
   --acme-email admin@example.com
@@ -115,9 +117,19 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
   --panel-url https://api.example.com \
-  --panel-token token \
+  --panel-token server_token \
   --node-id 1 \
   --self-signed-domain node.example.com
+```
+
+**Local `server_name` override**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token server_token \
+  --node-id 1 \
+  --server-name node.example.com
 ```
 
 Default install paths:
@@ -132,8 +144,11 @@ When `--xboard` is repeated, the installer creates one config per node under `/e
 
 When running as root on a systemd host, the script installs, enables, and starts the corresponding `systemd` service or services automatically.
 
+`--panel-token` must be the Xboard global `server_token` used by `/api/v1/server/UniProxy/*`, not a per-user token and not a subscription token. This is enforced by Xboard in `app/Http/Middleware/Server.php:14`.
+
 If `--acme-domain` is used, the installer enables `[tls.acme]` in `config.toml` and skips self-signed generation.
 If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer tries to fetch `server_name` from Xboard and auto-generates a per-node self-signed certificate when no certificate already exists.
+If `--server-name` is passed, the installer writes `tls.server_name` locally and that value takes precedence over the panel response at runtime.
 
 ### Uninstall
 

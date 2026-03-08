@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -25,11 +25,11 @@ pub enum FetchState<T> {
 pub struct NodeConfigResponse {
     pub protocol: String,
     pub server_port: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub server_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub padding_scheme: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub base_config: Option<BaseConfig>,
@@ -60,9 +60,9 @@ pub struct RouteConfig {
     pub id: i64,
     #[serde(default, rename = "match")]
     pub match_value: Option<RouteMatch>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub action: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub action_value: String,
 }
 
@@ -100,9 +100,9 @@ pub struct UsersResponse {
 pub struct PanelUser {
     pub id: i64,
     pub uuid: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub speed_limit: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_default_on_null")]
     pub device_limit: i64,
 }
 
@@ -264,6 +264,14 @@ fn value_to_u64(value: Option<&serde_json::Value>) -> Option<u64> {
     }
 }
 
+fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +320,47 @@ mod tests {
                 "protocol:udp".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn accepts_nulls_in_node_config_response() {
+        let config: NodeConfigResponse = serde_json::from_value(serde_json::json!({
+            "protocol": "anytls",
+            "server_port": 443,
+            "server_name": null,
+            "padding_scheme": null,
+            "routes": null,
+            "base_config": {
+                "push_interval": 60,
+                "pull_interval": 60
+            }
+        }))
+        .expect("parse config");
+        assert_eq!(config.server_name, "");
+        assert!(config.padding_scheme.is_empty());
+        assert!(config.routes.is_empty());
+    }
+
+    #[test]
+    fn accepts_nulls_in_route_and_user_defaults() {
+        let route: RouteConfig = serde_json::from_value(serde_json::json!({
+            "id": 9,
+            "match": null,
+            "action": null,
+            "action_value": null
+        }))
+        .expect("parse route");
+        assert_eq!(route.action, "");
+        assert_eq!(route.action_value, "");
+
+        let user: PanelUser = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "uuid": "test-user",
+            "speed_limit": null,
+            "device_limit": null
+        }))
+        .expect("parse user");
+        assert_eq!(user.speed_limit, 0);
+        assert_eq!(user.device_limit, 0);
     }
 }

@@ -30,11 +30,20 @@ pub struct EffectiveNodeConfig {
 
 impl EffectiveNodeConfig {
     pub fn from_remote(local: &AppConfig, remote: &NodeConfigResponse) -> Self {
+        let local_server_name = local.tls.server_name.trim();
         Self {
             listen_ip: local.node.listen_ip.clone(),
             server_port: remote.server_port,
-            server_name: remote.server_name.clone(),
-            padding_scheme: remote.padding_scheme.clone(),
+            server_name: if local_server_name.is_empty() {
+                remote.server_name.clone()
+            } else {
+                local_server_name.to_string()
+            },
+            padding_scheme: if remote.padding_scheme.is_empty() {
+                PaddingScheme::default_lines()
+            } else {
+                remote.padding_scheme.clone()
+            },
             routes: remote.routes.clone(),
         }
     }
@@ -47,6 +56,73 @@ pub struct ServerController {
     padding_scheme: Arc<RwLock<PaddingScheme>>,
     route_rules: Arc<RwLock<RouteRules>>,
     inner: Mutex<Option<RunningServer>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{
+        AppConfig, LogConfig, NodeConfig, PanelConfig, ReportConfig, SyncConfig, TlsConfig,
+    };
+    use crate::panel::NodeConfigResponse;
+    use std::path::PathBuf;
+
+    fn app_config(server_name: &str) -> AppConfig {
+        AppConfig {
+            panel: PanelConfig {
+                url: "https://panel.example.com".to_string(),
+                token: "token".to_string(),
+                node_id: 1,
+                node_type: "anytls".to_string(),
+                timeout_seconds: 15,
+            },
+            node: NodeConfig {
+                listen_ip: "0.0.0.0".to_string(),
+                node_type: "anytls".to_string(),
+            },
+            tls: TlsConfig {
+                cert_path: PathBuf::from("cert.pem"),
+                key_path: PathBuf::from("key.pem"),
+                server_name: server_name.to_string(),
+                reload_interval_seconds: 60,
+                acme: None,
+            },
+            sync: SyncConfig::default(),
+            report: ReportConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+
+    #[test]
+    fn prefers_local_tls_server_name() {
+        let local = app_config("local.example.com");
+        let remote = NodeConfigResponse {
+            protocol: "anytls".to_string(),
+            server_port: 443,
+            server_name: "remote.example.com".to_string(),
+            padding_scheme: vec!["stop=1".to_string(), "0=1-1".to_string()],
+            routes: Vec::new(),
+            base_config: None,
+        };
+        let effective = EffectiveNodeConfig::from_remote(&local, &remote);
+        assert_eq!(effective.server_name, "local.example.com");
+    }
+
+    #[test]
+    fn falls_back_to_remote_server_name_and_default_padding() {
+        let local = app_config("");
+        let remote = NodeConfigResponse {
+            protocol: "anytls".to_string(),
+            server_port: 443,
+            server_name: "remote.example.com".to_string(),
+            padding_scheme: Vec::new(),
+            routes: Vec::new(),
+            base_config: None,
+        };
+        let effective = EffectiveNodeConfig::from_remote(&local, &remote);
+        assert_eq!(effective.server_name, "remote.example.com");
+        assert_eq!(effective.padding_scheme, PaddingScheme::default_lines());
+    }
 }
 
 struct RunningServer {
