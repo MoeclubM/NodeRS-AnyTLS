@@ -54,8 +54,9 @@ jobs:
           cp "target/${TARGET}/release/${BIN_NAME}" "$package_dir/${BIN_NAME}"
           cp README.md LICENSE config.example.toml "$package_dir/"
           cp scripts/install.sh "$package_dir/install.sh"
+          cp scripts/upgrade.sh "$package_dir/upgrade.sh"
           cp packaging/systemd/noders-anytls.service "$package_dir/packaging/systemd/noders-anytls.service"
-          chmod +x "$package_dir/install.sh" "$package_dir/${BIN_NAME}"
+          chmod +x "$package_dir/install.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
           tar -C dist -czf "${package_dir}.tar.gz" "$(basename "$package_dir")"
           sha256sum "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"
 

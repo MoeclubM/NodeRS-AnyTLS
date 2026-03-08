@@ -80,6 +80,7 @@ Each archive contains:
 - `noders-anytls`
 - `config.example.toml`
 - `install.sh`
+- `upgrade.sh`
 - `packaging/systemd/noders-anytls.service`
 - `README.md`
 - `LICENSE`
@@ -171,6 +172,30 @@ If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer t
 If `--server-name` is passed, the installer writes `tls.server_name` locally and that value takes precedence over the panel response at runtime.
 If `--dns-resolver` is set to `system`, the node uses the system resolver; any other value is treated as a custom nameserver. `--ip-strategy` controls address ordering for domain outbound connections.
 The generated config does not include local pull/push interval knobs; sync and traffic/alive reporting follow Xboard `base_config.pull_interval` / `push_interval` automatically.
+
+### Upgrade
+
+The upgrade script only replaces the binary and restarts currently active `noders-anytls-*` services. Existing node configs, certificates, ACME account files, and state are preserved.
+
+**Upgrade to the latest release**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s --
+```
+
+**Upgrade to a specific release**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.5
+```
+
+**Upgrade without restarting services**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.5 --no-restart
+```
+
+If a restarted service fails after the new binary is installed, the upgrader restores the previous binary automatically and attempts to restart the previously active services again.
 
 ### Uninstall
 
