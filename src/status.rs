@@ -3,7 +3,7 @@ use crate::panel::{MemoryStat, StatusPayload};
 pub fn collect_status() -> StatusPayload {
     #[cfg(windows)]
     {
-        return windows::collect_status();
+        windows::collect_status()
     }
 
     #[cfg(not(windows))]

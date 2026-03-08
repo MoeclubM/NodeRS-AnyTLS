@@ -4,6 +4,9 @@ mod rules;
 mod session;
 mod socksaddr;
 mod tls;
+mod traffic;
+mod transport;
+mod uot;
 
 use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
@@ -64,9 +67,7 @@ pub struct ServerController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AppConfig, LogConfig, NodeConfig, PanelConfig, ReportConfig, SyncConfig, TlsConfig,
-    };
+    use crate::config::{AppConfig, LogConfig, NodeConfig, PanelConfig, ReportConfig, TlsConfig};
     use crate::panel::NodeConfigResponse;
     use std::path::PathBuf;
 
@@ -89,7 +90,6 @@ mod tests {
                 acme: None,
             },
             outbound: crate::config::OutboundConfig::default(),
-            sync: SyncConfig::default(),
             report: ReportConfig::default(),
             log: LogConfig::default(),
         }

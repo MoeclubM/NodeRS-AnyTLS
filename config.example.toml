@@ -27,11 +27,7 @@ check_interval_seconds = 86400
 renew_before_days = 30
 account_key_path = "acme-account.pem"
 
-[sync]
-pull_interval_seconds = 60
-
 [report]
-push_interval_seconds = 60
 status_interval_seconds = 60
 min_traffic_bytes = 0
 

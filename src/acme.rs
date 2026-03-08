@@ -534,10 +534,10 @@ async fn load_or_create_private_key(
     path: &Path,
     persist_generated: bool,
 ) -> anyhow::Result<RsaPrivateKey> {
-    if let Ok(existing) = tokio::fs::read_to_string(path).await {
-        if let Ok(key) = parse_private_key(existing).await {
-            return Ok(key);
-        }
+    if let Ok(existing) = tokio::fs::read_to_string(path).await
+        && let Ok(key) = parse_private_key(existing).await
+    {
+        return Ok(key);
     }
 
     let key = tokio::task::spawn_blocking(|| {
@@ -610,9 +610,9 @@ fn build_key_authorization(token: &str, thumbprint: &str) -> String {
 fn build_jwk(key: &RsaPrivateKey) -> Value {
     let public_key = key.to_public_key();
     json!({
-        "e": base64url(&public_key.e().to_bytes_be()),
+        "e": base64url(public_key.e().to_bytes_be()),
         "kty": "RSA",
-        "n": base64url(&public_key.n().to_bytes_be()),
+        "n": base64url(public_key.n().to_bytes_be()),
     })
 }
 
@@ -620,8 +620,8 @@ fn jwk_thumbprint(key: &RsaPrivateKey) -> anyhow::Result<String> {
     let public_key = key.to_public_key();
     let jwk = format!(
         "{{\"e\":\"{}\",\"kty\":\"RSA\",\"n\":\"{}\"}}",
-        base64url(&public_key.e().to_bytes_be()),
-        base64url(&public_key.n().to_bytes_be()),
+        base64url(public_key.e().to_bytes_be()),
+        base64url(public_key.n().to_bytes_be()),
     );
     Ok(base64url(Sha256::digest(jwk.as_bytes()).as_slice()))
 }
@@ -629,7 +629,7 @@ fn jwk_thumbprint(key: &RsaPrivateKey) -> anyhow::Result<String> {
 fn sign_base64url(key: &RsaPrivateKey, message: &[u8]) -> anyhow::Result<String> {
     let signing_key = SigningKey::<Sha256>::new(key.clone());
     let signature = signing_key.sign(message);
-    Ok(base64url(&signature.to_bytes()))
+    Ok(base64url(signature.to_bytes()))
 }
 
 fn build_certificate_signing_request(

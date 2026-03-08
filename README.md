@@ -5,6 +5,7 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 ## Features
 
 - Native Rust AnyTLS inbound with TLS handshake and stream multiplexing
+- Native Rust UOT support for `sp.v2.udp-over-tcp.arpa` and legacy `sp.udp-over-tcp.arpa`
 - Xboard `UniProxy` compatibility for `config`, `user`, `push`, `alive`, `alivelist`, `status`
 - Multi-user hot reload, kicked sessions on removal, and shared per-user speed limiting
 - Device limit enforcement with local + panel alive-state accounting
@@ -16,6 +17,7 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 ## Implementation
 
 - The AnyTLS protocol stack is implemented directly in this repository under `src/server/`
+- Transport responsibilities are split across `src/server/session.rs`, `src/server/uot.rs`, `src/server/transport.rs`, and `src/server/traffic.rs` for easier maintenance
 - No `sing-box_mod`, `sing-box`, subprocess core, FFI bridge, or external protocol engine is used at runtime
 - CI enforces this constraint with `scripts/verify-pure-rust.sh`
 
@@ -24,9 +26,11 @@ Rust implementation of an Xboard `UniProxy` AnyTLS node.
 - `uTLS` is an outbound TLS fingerprinting feature in `sing-box_mod`; it does not apply to this inbound node process
 - Server-side AnyTLS padding negotiation is implemented by accepting client preface padding and sending `UPDATE_PADDING_SCHEME` when `padding-md5` mismatches
 - Active record padding generation is a client-side behavior in the upstream AnyTLS reference implementation, so it is intentionally not emitted by this server
+- UOT is handled inside the AnyTLS stream layer using the protocol-defined request and datagram framing for `sp.v2.udp-over-tcp.arpa`
 - Local `tls.server_name` takes precedence over panel `server_name`
 - Wildcard listen now binds IPv4 and IPv6 simultaneously on Linux when available
 - Certificate files are hot-reloaded from disk according to `tls.reload_interval_seconds`
+- Panel `base_config.pull_interval` / `push_interval` drive config sync and traffic/alive reporting cadence at runtime
 - Embedded ACME HTTP-01 is implemented in pure Rust under `src/acme.rs`; issued certificates are renewed before expiry and reloaded automatically
 - ACME renewal timing is computed from the current certificate `notAfter` field rather than a fixed timer guess
 - ACME `http-01` requires `tls.acme.challenge_listen` to be reachable by the CA, typically `[::]:80`
@@ -59,7 +63,8 @@ DNS routes are applied only to domain targets. IP targets bypass DNS rules.
 4. Optional: set `[outbound] dns_resolver` to `system` or a custom server such as `1.1.1.1`
 5. Optional: set `[outbound] ip_strategy` to `system`, `prefer_ipv4`, or `prefer_ipv6`
 6. Optional: enable `[tls.acme]` for built-in HTTP-01 certificate issuance
-7. Run `cargo run --offline -- config.toml`
+7. `pull_interval` / `push_interval` do not need local config; the node follows Xboard `base_config`
+8. Run `cargo run --offline -- config.toml`
 
 ## Release Packaging
 
@@ -165,6 +170,7 @@ If `--acme-domain` is used, the installer enables `[tls.acme]` in `config.toml` 
 If neither `--self-signed-domain` nor `--acme-domain` is passed, the installer tries to fetch `server_name` from Xboard and auto-generates a per-node self-signed certificate when no certificate already exists.
 If `--server-name` is passed, the installer writes `tls.server_name` locally and that value takes precedence over the panel response at runtime.
 If `--dns-resolver` is set to `system`, the node uses the system resolver; any other value is treated as a custom nameserver. `--ip-strategy` controls address ordering for domain outbound connections.
+The generated config does not include local pull/push interval knobs; sync and traffic/alive reporting follow Xboard `base_config.pull_interval` / `push_interval` automatically.
 
 ### Uninstall
 

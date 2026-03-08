@@ -81,7 +81,7 @@ fn append_query_result(target: &mut Vec<IpAddr>, result: Result<&Vec<IpAddr>, &a
     }
 }
 
-fn reorder_ips(resolved: &mut Vec<IpAddr>, ip_strategy: IpStrategy) {
+fn reorder_ips(resolved: &mut [IpAddr], ip_strategy: IpStrategy) {
     match ip_strategy {
         IpStrategy::System => {}
         IpStrategy::PreferIpv4 => {
@@ -169,10 +169,10 @@ fn parse_nameserver_spec(spec: &str) -> anyhow::Result<(String, u16)> {
         return Ok((host.to_string(), port));
     }
 
-    if let Some((host, port)) = spec.rsplit_once(':') {
-        if !host.contains(':') {
-            return Ok((host.to_string(), port.parse::<u16>()?));
-        }
+    if let Some((host, port)) = spec.rsplit_once(':')
+        && !host.contains(':')
+    {
+        return Ok((host.to_string(), port.parse::<u16>()?));
     }
 
     Ok((spec.to_string(), 53))

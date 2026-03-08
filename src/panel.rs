@@ -163,7 +163,7 @@ impl PanelClient {
             .await
             .context("request Xboard alive list")?;
         self.ensure_success(response.status(), "fetch alive list")?;
-        Ok(response.json().await.context("decode alive list")?)
+        response.json().await.context("decode alive list")
     }
 
     pub async fn report_traffic(&self, traffic: HashMap<i64, [u64; 2]>) -> anyhow::Result<()> {

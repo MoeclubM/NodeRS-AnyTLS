@@ -11,8 +11,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub outbound: OutboundConfig,
     #[serde(default)]
-    pub sync: SyncConfig,
-    #[serde(default)]
     pub report: ReportConfig,
     #[serde(default)]
     pub log: LogConfig,
@@ -129,23 +127,7 @@ pub struct AcmeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct SyncConfig {
-    #[serde(default = "default_pull_interval_seconds")]
-    pub pull_interval_seconds: u64,
-}
-
-impl Default for SyncConfig {
-    fn default() -> Self {
-        Self {
-            pull_interval_seconds: default_pull_interval_seconds(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ReportConfig {
-    #[serde(default = "default_push_interval_seconds")]
-    pub push_interval_seconds: u64,
     #[serde(default = "default_status_interval_seconds")]
     pub status_interval_seconds: u64,
     #[serde(default)]
@@ -155,7 +137,6 @@ pub struct ReportConfig {
 impl Default for ReportConfig {
     fn default() -> Self {
         Self {
-            push_interval_seconds: default_push_interval_seconds(),
             status_interval_seconds: default_status_interval_seconds(),
             min_traffic_bytes: 0,
         }
@@ -182,14 +163,6 @@ fn default_timeout_seconds() -> u64 {
 
 fn default_listen_ip() -> String {
     "::".to_string()
-}
-
-fn default_pull_interval_seconds() -> u64 {
-    60
-}
-
-fn default_push_interval_seconds() -> u64 {
-    60
 }
 
 fn default_status_interval_seconds() -> u64 {

@@ -1,5 +1,6 @@
 use anyhow::Context;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{error, info, warn};
 
@@ -10,13 +11,16 @@ use crate::panel::{FetchState, NodeConfigResponse, PanelClient};
 use crate::server::{EffectiveNodeConfig, ServerController};
 use crate::status;
 
+const DEFAULT_PANEL_PULL_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_PANEL_PUSH_INTERVAL_SECONDS: u64 = 60;
+
 pub async fn run(config: AppConfig) -> anyhow::Result<()> {
-    if let Some(acme_config) = config.tls.acme.as_ref().filter(|acme| acme.enabled) {
-        if acme::ensure_certificate(acme_config, &config.tls.cert_path, &config.tls.key_path)
+    if let Some(acme_config) = config.tls.acme.as_ref()
+        && acme_config.enabled
+        && acme::ensure_certificate(acme_config, &config.tls.cert_path, &config.tls.key_path)
             .await?
-        {
-            info!(domain = %acme_config.domain, "ACME certificate issued or renewed before startup");
-        }
+    {
+        info!(domain = %acme_config.domain, "ACME certificate issued or renewed before startup");
     }
 
     let panel = Arc::new(PanelClient::new(&config.panel)?);
@@ -47,33 +51,28 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
         user_etag = etag;
     }
 
-    let pull_interval = remote
-        .base_config
-        .as_ref()
-        .and_then(|base| base.pull_interval_seconds())
-        .unwrap_or(config.sync.pull_interval_seconds)
-        .max(5);
-    let push_interval = remote
-        .base_config
-        .as_ref()
-        .and_then(|base| base.push_interval_seconds())
-        .unwrap_or(config.report.push_interval_seconds)
-        .max(5);
+    let pull_interval = Arc::new(AtomicU64::new(pull_interval_seconds(&remote)));
+    let push_interval = Arc::new(AtomicU64::new(push_interval_seconds(&remote)));
 
     let sync_panel = panel.clone();
     let sync_server = server.clone();
     let sync_accounting = accounting.clone();
     let sync_config = config.clone();
+    let sync_pull_interval = pull_interval.clone();
+    let sync_push_interval = push_interval.clone();
     tokio::spawn(async move {
         let mut config_etag = config_etag;
         let mut user_etag = user_etag;
-        let mut ticker = tokio::time::interval(Duration::from_secs(pull_interval));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::time::sleep(Duration::from_secs(
+                sync_pull_interval.load(Ordering::Relaxed).max(5),
+            ))
+            .await;
             match sync_panel.fetch_node_config(config_etag.as_deref()).await {
                 Ok(FetchState::Modified(remote, etag)) => {
                     config_etag = etag;
+                    sync_pull_interval.store(pull_interval_seconds(&remote), Ordering::Relaxed);
+                    sync_push_interval.store(push_interval_seconds(&remote), Ordering::Relaxed);
                     if let Err(error) =
                         apply_remote_config(&sync_config, &sync_server, &remote).await
                     {
@@ -147,13 +146,16 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
     let report_panel = panel.clone();
     let report_accounting = accounting.clone();
     let min_traffic_bytes = config.report.min_traffic_bytes;
+    let report_push_interval = push_interval.clone();
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(push_interval));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
-            ticker.tick().await;
+            tokio::time::sleep(Duration::from_secs(
+                report_push_interval.load(Ordering::Relaxed).max(5),
+            ))
+            .await;
             let traffic = report_accounting.snapshot_traffic(min_traffic_bytes);
-            if let Err(error) = report_panel.report_traffic(traffic).await {
+            if let Err(error) = report_panel.report_traffic(traffic.clone()).await {
+                report_accounting.restore_traffic(&traffic);
                 warn!(%error, "traffic report failed");
             }
             let alive = report_accounting.snapshot_alive();
@@ -192,4 +194,22 @@ async fn apply_remote_config(
     }
     let effective = EffectiveNodeConfig::from_remote(app_config, remote);
     server.apply_config(effective).await
+}
+
+fn pull_interval_seconds(remote: &NodeConfigResponse) -> u64 {
+    remote
+        .base_config
+        .as_ref()
+        .and_then(|base| base.pull_interval_seconds())
+        .unwrap_or(DEFAULT_PANEL_PULL_INTERVAL_SECONDS)
+        .max(5)
+}
+
+fn push_interval_seconds(remote: &NodeConfigResponse) -> u64 {
+    remote
+        .base_config
+        .as_ref()
+        .and_then(|base| base.push_interval_seconds())
+        .unwrap_or(DEFAULT_PANEL_PUSH_INTERVAL_SECONDS)
+        .max(5)
 }

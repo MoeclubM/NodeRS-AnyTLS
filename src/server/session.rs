@@ -15,10 +15,12 @@ use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::config::OutboundConfig;
 use crate::limiter::SharedRateLimiter;
 
-use super::dns;
 use super::padding::PaddingScheme;
 use super::rules::RouteRules;
 use super::socksaddr::SocksAddr;
+use super::traffic::TrafficRecorder;
+use super::transport;
+use super::uot;
 
 const CMD_WASTE: u8 = 0;
 const CMD_SYN: u8 = 1;
@@ -45,16 +47,18 @@ pub async fn serve_connection(
     let user = authenticate(&mut stream, &accounting).await?;
     let lease = accounting.open_session(&user, source)?;
     let control = lease.control();
-    let session = Session::new(
-        stream,
-        source,
-        user.clone(),
+    let (reader, writer) = split(stream);
+    let session = Session {
+        user: user.clone(),
         lease,
-        accounting.clone(),
+        accounting: accounting.clone(),
         padding,
         route_rules,
         outbound,
-    );
+        reader: Mutex::new(reader),
+        writer: Arc::new(Mutex::new(writer)),
+        state: Arc::new(Mutex::new(SessionState::default())),
+    };
     let result = session.run().await;
     if control.is_cancelled() {
         return Ok(());
@@ -88,7 +92,6 @@ async fn authenticate(
 }
 
 struct Session {
-    source: SocketAddr,
     user: UserEntry,
     lease: SessionLease,
     accounting: Arc<Accounting>,
@@ -112,32 +115,24 @@ struct StreamState {
     outbound_task: JoinHandle<()>,
 }
 
-impl Session {
-    fn new(
-        stream: TlsStream,
-        source: SocketAddr,
-        user: UserEntry,
-        lease: SessionLease,
-        accounting: Arc<Accounting>,
-        padding: PaddingScheme,
-        route_rules: RouteRules,
-        outbound: OutboundConfig,
-    ) -> Self {
-        let (reader, writer) = split(stream);
-        Self {
-            source,
-            user,
-            lease,
-            accounting,
-            padding,
-            route_rules,
-            outbound,
-            reader: Mutex::new(reader),
-            writer: Arc::new(Mutex::new(writer)),
-            state: Arc::new(Mutex::new(SessionState::default())),
-        }
-    }
+struct StreamOutcome {
+    established: bool,
+    result: anyhow::Result<()>,
+}
 
+#[derive(Clone)]
+struct StreamContext {
+    writer: Arc<Mutex<WriteHalf<TlsStream>>>,
+    control: Arc<SessionControl>,
+    limiter: Option<Arc<SharedRateLimiter>>,
+    route_rules: RouteRules,
+    outbound: OutboundConfig,
+    upload_traffic: TrafficRecorder,
+    download_traffic: TrafficRecorder,
+    send_synack: bool,
+}
+
+impl Session {
     async fn run(self) -> anyhow::Result<()> {
         let control = self.lease.control();
         let result = loop {
@@ -252,28 +247,30 @@ impl Session {
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
-        let source = self.source;
         let user = self.user.clone();
         let control = self.lease.control();
-        let limiter = self.lease.limiter();
-        let route_rules = self.route_rules.clone();
-        let outbound = self.outbound.clone();
+        let context = StreamContext {
+            writer: writer.clone(),
+            control: control.clone(),
+            limiter: self.lease.limiter(),
+            route_rules: self.route_rules.clone(),
+            outbound: self.outbound.clone(),
+            upload_traffic: TrafficRecorder::upload(accounting.clone(), user.id),
+            download_traffic: TrafficRecorder::download(accounting, user.id),
+            send_synack: peer_version >= 2,
+        };
+        let state = self.state.clone();
         tokio::spawn(async move {
-            if let Err(error) = handle_stream(
-                stream_id,
-                app_side,
-                writer,
-                accounting,
-                source,
-                user,
-                control,
-                limiter,
-                route_rules,
-                outbound,
-                peer_version >= 2,
-            )
-            .await
+            let outcome = handle_stream(stream_id, app_side, user, context).await;
+
+            if let Some(stream_state) = state.lock().await.streams.remove(&stream_id)
+                && !outcome.established
+                && !stream_state.outbound_task.is_finished()
             {
+                stream_state.outbound_task.abort();
+            }
+
+            if let Err(error) = outcome.result {
                 warn!(%error, stream_id, "AnyTLS stream handler failed");
             }
         });
@@ -381,55 +378,169 @@ struct FrameHeader {
 async fn handle_stream(
     stream_id: u32,
     mut app_side: DuplexStream,
-    writer: Arc<Mutex<WriteHalf<TlsStream>>>,
-    accounting: Arc<Accounting>,
-    _source: SocketAddr,
     user: UserEntry,
+    context: StreamContext,
+) -> StreamOutcome {
+    if context.control.is_cancelled() {
+        return StreamOutcome {
+            established: false,
+            result: Err(anyhow!("session cancelled before stream setup")),
+        };
+    }
+    let destination = match SocksAddr::read_from(&mut app_side)
+        .await
+        .context("read target address")
+    {
+        Ok(destination) => destination,
+        Err(error) => {
+            return StreamOutcome {
+                established: false,
+                result: Err(error),
+            };
+        }
+    };
+    if let Some(version) = uot::version_for(&destination) {
+        let request = match uot::read_request(&mut app_side, version).await {
+            Ok(request) => request,
+            Err(error) => {
+                return StreamOutcome {
+                    established: false,
+                    result: Err(error),
+                };
+            }
+        };
+        let prepared = uot::prepare(request, &context.route_rules, &context.outbound).await;
+        let established = prepared.is_ok();
+        let result = async {
+            match prepared {
+                Ok(prepared) => {
+                    if context.send_synack {
+                        write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
+                    }
+                    prepared
+                        .run(
+                            app_side,
+                            context.control,
+                            context.limiter,
+                            context.upload_traffic,
+                            context.download_traffic,
+                        )
+                        .await?;
+                    info!(stream_id, user = %user.uuid, version = ?version, "UOT stream closed");
+                    Ok(())
+                }
+                Err(error) => {
+                    if context.send_synack {
+                        write_frame(
+                            &context.writer,
+                            CMD_SYNACK,
+                            stream_id,
+                            error.to_string().as_bytes(),
+                        )
+                        .await?;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        return StreamOutcome {
+            established,
+            result,
+        };
+    }
+
+    if context.route_rules.is_blocked(&destination, "tcp") {
+        let error = anyhow!("destination blocked by Xboard route rules: {destination}");
+        let result = async {
+            if context.send_synack {
+                write_frame(
+                    &context.writer,
+                    CMD_SYNACK,
+                    stream_id,
+                    error.to_string().as_bytes(),
+                )
+                .await?;
+            }
+            Err(error)
+        }
+        .await;
+        return StreamOutcome {
+            established: false,
+            result,
+        };
+    }
+
+    let mut remote =
+        transport::connect_tcp_destination(&destination, &context.route_rules, &context.outbound)
+            .await
+            .with_context(|| format!("connect remote destination {destination}"));
+
+    let result = async {
+        match remote.as_mut() {
+            Ok(stream) => {
+                if context.send_synack {
+                    write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
+                }
+                handle_tcp_stream(
+                    app_side,
+                    stream,
+                    context.control,
+                    context.limiter,
+                    context.upload_traffic,
+                    context.download_traffic,
+                )
+                .await
+            }
+            Err(error) => {
+                if context.send_synack {
+                    write_frame(
+                        &context.writer,
+                        CMD_SYNACK,
+                        stream_id,
+                        error.to_string().as_bytes(),
+                    )
+                    .await?;
+                }
+                Err(anyhow!(error.to_string()))
+            }
+        }
+    }
+    .await;
+
+    StreamOutcome {
+        established: remote.is_ok(),
+        result: result.map(|(uploaded, downloaded)| {
+            info!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
+        }),
+    }
+}
+
+async fn handle_tcp_stream(
+    app_side: DuplexStream,
+    stream: &mut TcpStream,
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
-    route_rules: RouteRules,
-    outbound: OutboundConfig,
-    send_synack: bool,
-) -> anyhow::Result<()> {
-    if control.is_cancelled() {
-        bail!("session cancelled before stream setup")
-    }
-    let destination = SocksAddr::read_from(&mut app_side)
-        .await
-        .context("read target address")?;
-    if route_rules.is_blocked(&destination, "tcp") {
-        let error = anyhow!("destination blocked by Xboard route rules: {destination}");
-        if send_synack {
-            write_frame(&writer, CMD_SYNACK, stream_id, error.to_string().as_bytes()).await?;
-        }
-        return Err(error);
-    }
-    let mut remote = connect_destination(&destination, &route_rules, &outbound)
-        .await
-        .with_context(|| format!("connect remote destination {destination}"));
-
-    match remote.as_mut() {
-        Ok(stream) => {
-            if send_synack {
-                write_frame(&writer, CMD_SYNACK, stream_id, &[]).await?;
-            }
-            let (mut read_a, mut write_a) = tokio::io::split(app_side);
-            let (mut read_b, mut write_b) = stream.split();
-            let upload = pump_copy(&mut read_a, &mut write_b, control.clone(), limiter.clone());
-            let download = pump_copy(&mut read_b, &mut write_a, control.clone(), limiter);
-            let (uploaded, downloaded) = tokio::try_join!(upload, download)?;
-            accounting.record_upload(user.id, uploaded);
-            accounting.record_download(user.id, downloaded);
-            info!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
-            Ok(())
-        }
-        Err(error) => {
-            if send_synack {
-                write_frame(&writer, CMD_SYNACK, stream_id, error.to_string().as_bytes()).await?;
-            }
-            Err(anyhow!(error.to_string()))
-        }
-    }
+    upload_traffic: TrafficRecorder,
+    download_traffic: TrafficRecorder,
+) -> anyhow::Result<(u64, u64)> {
+    let (mut read_a, mut write_a) = tokio::io::split(app_side);
+    let (mut read_b, mut write_b) = stream.split();
+    let upload = pump_copy(
+        &mut read_a,
+        &mut write_b,
+        control.clone(),
+        limiter.clone(),
+        Some(upload_traffic),
+    );
+    let download = pump_copy(
+        &mut read_b,
+        &mut write_a,
+        control,
+        limiter,
+        Some(download_traffic),
+    );
+    tokio::try_join!(upload, download)
 }
 
 async fn pump_copy<R, W>(
@@ -437,6 +548,7 @@ async fn pump_copy<R, W>(
     writer: &mut W,
     control: Arc<SessionControl>,
     limiter: Option<Arc<SharedRateLimiter>>,
+    traffic: Option<TrafficRecorder>,
 ) -> anyhow::Result<u64>
 where
     R: AsyncRead + Unpin,
@@ -468,7 +580,11 @@ where
                 result.context("write throttled chunk")?;
             }
         }
-        total += read as u64;
+        let transferred = read as u64;
+        total += transferred;
+        if let Some(traffic) = traffic.as_ref() {
+            traffic.record(transferred);
+        }
     }
 }
 
@@ -518,36 +634,6 @@ async fn write_frame(
     Ok(())
 }
 
-async fn connect_destination(
-    destination: &SocksAddr,
-    route_rules: &RouteRules,
-    outbound: &OutboundConfig,
-) -> anyhow::Result<TcpStream> {
-    match destination {
-        SocksAddr::Ip(addr) => TcpStream::connect(addr)
-            .await
-            .context("connect IP destination"),
-        SocksAddr::Domain(host, port) => {
-            let dns_server = route_rules.dns_server_for(host);
-            let resolved = dns::resolve_domain(host, dns_server, outbound)
-                .await
-                .with_context(|| format!("resolve {host}:{port}"))?;
-            let mut last_error = None;
-            for ip in resolved {
-                let target = SocketAddr::new(ip, *port);
-                match TcpStream::connect(target).await {
-                    Ok(stream) => return Ok(stream),
-                    Err(error) => last_error = Some((target, error)),
-                }
-            }
-            if let Some((target, error)) = last_error {
-                return Err(error).with_context(|| format!("connect {host}:{port} via {target}"));
-            }
-            bail!("no addresses resolved for {host}:{port}")
-        }
-    }
-}
-
 fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
     String::from_utf8_lossy(bytes)
         .lines()
@@ -572,11 +658,50 @@ fn is_eof(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn parses_settings_lines() {
         let settings = parse_settings(b"v=2\nclient=test");
         assert_eq!(settings.get("v"), Some(&"2".to_string()));
         assert_eq!(settings.get("client"), Some(&"test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pump_copy_records_traffic_before_stream_close() {
+        let accounting = Accounting::new();
+        let control = SessionControl::new();
+        let (mut source_reader, mut source_writer) = tokio::io::duplex(64);
+        let (mut sink_writer, mut sink_reader) = tokio::io::duplex(64);
+
+        let task = tokio::spawn({
+            let control = control.clone();
+            let accounting = accounting.clone();
+            async move {
+                pump_copy(
+                    &mut source_reader,
+                    &mut sink_writer,
+                    control,
+                    None,
+                    Some(TrafficRecorder::upload(accounting, 7)),
+                )
+                .await
+            }
+        });
+
+        source_writer
+            .write_all(b"hello")
+            .await
+            .expect("write source");
+        let mut buf = [0u8; 5];
+        sink_reader.read_exact(&mut buf).await.expect("read sink");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(accounting.snapshot_traffic(0).remove(&7), Some([5, 0]));
+
+        drop(source_writer);
+        let transferred = task.await.expect("join pump").expect("pump succeeds");
+        assert_eq!(transferred, 5);
     }
 }

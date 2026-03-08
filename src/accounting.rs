@@ -30,7 +30,7 @@ pub struct SessionControl {
 }
 
 impl SessionControl {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             notify: Notify::new(),
@@ -258,13 +258,26 @@ impl Accounting {
         let mut guard = self.traffic.lock().expect("traffic lock poisoned");
         let mut snapshot = HashMap::new();
         for (uid, counter) in guard.iter_mut() {
-            if counter.upload + counter.download >= min_traffic_bytes {
+            let total = counter.upload + counter.download;
+            if total > 0 && total >= min_traffic_bytes {
                 snapshot.insert(*uid, [counter.upload, counter.download]);
                 counter.upload = 0;
                 counter.download = 0;
             }
         }
         snapshot
+    }
+
+    pub fn restore_traffic(&self, traffic: &HashMap<i64, [u64; 2]>) {
+        if traffic.is_empty() {
+            return;
+        }
+        let mut guard = self.traffic.lock().expect("traffic lock poisoned");
+        for (uid, [upload, download]) in traffic {
+            let counter = guard.entry(*uid).or_default();
+            counter.upload += *upload;
+            counter.download += *download;
+        }
     }
 
     pub fn snapshot_alive(&self) -> HashMap<i64, Vec<String>> {
@@ -424,5 +437,19 @@ mod tests {
         let control = lease.control();
         accounting.replace_users(&[]);
         assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn restores_traffic_after_failed_push() {
+        let accounting = Accounting::new();
+        accounting.record_upload(1, 100);
+        accounting.record_download(1, 40);
+
+        let snapshot = accounting.snapshot_traffic(0);
+        assert_eq!(snapshot.get(&1), Some(&[100, 40]));
+        assert!(accounting.snapshot_traffic(0).is_empty());
+
+        accounting.restore_traffic(&snapshot);
+        assert_eq!(accounting.snapshot_traffic(0).get(&1), Some(&[100, 40]));
     }
 }
