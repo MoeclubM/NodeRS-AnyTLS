@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::config::{IpStrategy, OutboundConfig};
 
@@ -13,6 +13,7 @@ use super::rules::RouteRules;
 use super::socksaddr::SocksAddr;
 
 const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn connect_tcp_destination(
     destination: &SocksAddr,
@@ -86,7 +87,9 @@ pub async fn resolve_destination(
 }
 
 async fn connect_target(target: SocketAddr) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(target).await?;
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out"))??;
     configure_tcp_stream(&stream);
     Ok(stream)
 }

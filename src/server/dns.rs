@@ -1,15 +1,19 @@
 use anyhow::{Context, bail, ensure};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::net::{UdpSocket, lookup_host};
 use tokio::time::timeout;
 
 use crate::config::{IpStrategy, OutboundConfig};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_CACHE_TTL: Duration = Duration::from_secs(30);
+const DNS_CACHE_MAX_ENTRIES: usize = 1024;
 static NEXT_QUERY_ID: AtomicU16 = AtomicU16::new(1);
+static DNS_CACHE: OnceLock<Mutex<HashMap<DnsCacheKey, DnsCacheEntry>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordType {
@@ -17,29 +21,53 @@ enum RecordType {
     Aaaa = 28,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DnsCacheKey {
+    host: String,
+    nameserver: Option<String>,
+    ip_strategy: IpStrategy,
+}
+
+#[derive(Debug, Clone)]
+struct DnsCacheEntry {
+    resolved: Vec<IpAddr>,
+    expires_at: Instant,
+}
+
 pub async fn resolve_domain(
     host: &str,
     route_nameserver: Option<&str>,
     outbound: &OutboundConfig,
 ) -> anyhow::Result<Vec<IpAddr>> {
-    if let Some(nameserver) = route_nameserver.filter(|value| !value.trim().is_empty()) {
-        return resolve_with_nameserver(host, nameserver, outbound.ip_strategy).await;
+    let nameserver = route_nameserver
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| outbound.dns_resolver.nameserver());
+    let cache_key = DnsCacheKey {
+        host: host.trim().trim_end_matches('.').to_ascii_lowercase(),
+        nameserver: nameserver.map(|value| value.trim().to_ascii_lowercase()),
+        ip_strategy: outbound.ip_strategy,
+    };
+    if let Some(cached) = lookup_cached(&cache_key) {
+        return Ok(cached);
     }
 
-    if let Some(nameserver) = outbound.dns_resolver.nameserver() {
-        return resolve_with_nameserver(host, nameserver, outbound.ip_strategy).await;
-    }
+    let resolved = if let Some(nameserver) = nameserver {
+        resolve_with_nameserver(host, nameserver, outbound.ip_strategy).await?
+    } else {
+        let mut resolved = lookup_host((host, 0))
+            .await
+            .with_context(|| format!("resolve {host} via system DNS"))?
+            .map(|addr| addr.ip())
+            .collect::<Vec<_>>();
+        reorder_ips(&mut resolved, outbound.ip_strategy);
+        dedup_ips(&mut resolved);
+        if resolved.is_empty() {
+            bail!("no addresses resolved for {host}")
+        }
+        resolved
+    };
 
-    let mut resolved = lookup_host((host, 0))
-        .await
-        .with_context(|| format!("resolve {host} via system DNS"))?
-        .map(|addr| addr.ip())
-        .collect::<Vec<_>>();
-    reorder_ips(&mut resolved, outbound.ip_strategy);
-    dedup_ips(&mut resolved);
-    if resolved.is_empty() {
-        bail!("no addresses resolved for {host}")
-    }
+    store_cached(cache_key, &resolved);
     Ok(resolved)
 }
 
@@ -98,6 +126,31 @@ fn reorder_ips(resolved: &mut [IpAddr], ip_strategy: IpStrategy) {
 fn dedup_ips(resolved: &mut Vec<IpAddr>) {
     let mut seen = HashSet::new();
     resolved.retain(|ip| seen.insert(*ip));
+}
+
+fn lookup_cached(key: &DnsCacheKey) -> Option<Vec<IpAddr>> {
+    let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("DNS cache lock poisoned");
+    let now = Instant::now();
+    cache.retain(|_, entry| entry.expires_at > now);
+    cache.get(key).map(|entry| entry.resolved.clone())
+}
+
+fn store_cached(key: DnsCacheKey, resolved: &[IpAddr]) {
+    let cache = DNS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("DNS cache lock poisoned");
+    let now = Instant::now();
+    cache.retain(|_, entry| entry.expires_at > now);
+    if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        DnsCacheEntry {
+            resolved: resolved.to_vec(),
+            expires_at: now + DNS_CACHE_TTL,
+        },
+    );
 }
 
 async fn resolve_with_server(
@@ -378,5 +431,25 @@ mod tests {
         assert_eq!(ips.len(), 2);
         assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(ips[1], IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn stores_and_returns_cached_records() {
+        let key = DnsCacheKey {
+            host: "example.com".to_string(),
+            nameserver: None,
+            ip_strategy: IpStrategy::System,
+        };
+        store_cached(key.clone(), &[IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))]);
+
+        let lookup = DnsCacheKey {
+            host: "example.com".to_string(),
+            nameserver: None,
+            ip_strategy: IpStrategy::System,
+        };
+        assert_eq!(
+            lookup_cached(&lookup),
+            Some(vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))])
+        );
     }
 }

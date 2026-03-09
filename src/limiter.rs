@@ -16,6 +16,7 @@ struct BucketState {
 }
 
 impl SharedRateLimiter {
+    #[allow(dead_code)]
     pub fn new(bytes_per_second: u64) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(BucketState {
@@ -26,6 +27,7 @@ impl SharedRateLimiter {
         })
     }
 
+    #[allow(dead_code)]
     pub fn set_rate(&self, bytes_per_second: u64) {
         let mut state = self.state.lock().expect("rate limiter poisoned");
         state.bytes_per_second = bytes_per_second;
@@ -94,6 +96,7 @@ fn burst_window(bytes_per_second: u64, burst_bytes: u64) -> Duration {
     }
 }
 
+#[allow(dead_code)]
 fn bucket_capacity(bytes_per_second: u64) -> u64 {
     if bytes_per_second == 0 {
         0

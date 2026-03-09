@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Notify;
 
-use crate::limiter::SharedRateLimiter;
 use crate::panel::PanelUser;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +123,6 @@ pub struct Accounting {
     traffic: RwLock<HashMap<i64, Arc<UsageCounter>>>,
     online: Mutex<HashMap<i64, HashMap<String, usize>>>,
     external_alive: Mutex<HashMap<i64, usize>>,
-    speed_limiters: Mutex<HashMap<i64, Arc<SharedRateLimiter>>>,
     sessions: Mutex<HashMap<i64, HashMap<u64, Arc<SessionControl>>>>,
     session_seq: AtomicU64,
 }
@@ -193,22 +191,6 @@ impl Accounting {
             .expect("external alive lock poisoned")
             .retain(|uid, _| valid_ids.contains(uid));
 
-        {
-            let mut limiters = self
-                .speed_limiters
-                .lock()
-                .expect("speed limiter lock poisoned");
-            for user in users {
-                let rate = speed_limit_to_bytes_per_second(user.speed_limit);
-                if let Some(existing) = limiters.get(&user.id) {
-                    existing.set_rate(rate);
-                } else {
-                    limiters.insert(user.id, SharedRateLimiter::new(rate));
-                }
-            }
-            limiters.retain(|uid, _| valid_ids.contains(uid));
-        }
-
         let removed_ids = previous_by_id
             .keys()
             .filter(|uid| !valid_ids.contains(uid))
@@ -250,13 +232,6 @@ impl Accounting {
 
         let session_id = self.session_seq.fetch_add(1, Ordering::SeqCst) + 1;
         let control = SessionControl::new();
-        let _limiter = self
-            .speed_limiters
-            .lock()
-            .expect("speed limiter lock poisoned")
-            .get(&user.id)
-            .cloned();
-
         {
             let mut online = self.online.lock().expect("online lock poisoned");
             let ip_map = online.entry(user.id).or_default();
@@ -408,14 +383,6 @@ fn sha256_bytes(input: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(input);
     hasher.finalize().into()
-}
-
-fn speed_limit_to_bytes_per_second(limit_mbps: i64) -> u64 {
-    if limit_mbps <= 0 {
-        0
-    } else {
-        (limit_mbps as u64).saturating_mul(1_000_000) / 8
-    }
 }
 
 fn normalize_ip(ip: String) -> String {

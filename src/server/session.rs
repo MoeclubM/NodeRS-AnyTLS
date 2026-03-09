@@ -37,6 +37,8 @@ const CMD_SYNACK: u8 = 7;
 const CMD_HEART_REQUEST: u8 = 8;
 const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
+const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
+const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
@@ -170,7 +172,7 @@ impl FrameWriter {
     }
 
     async fn send(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
-        if payload.len() > u16::MAX as usize {
+        if payload.len() > MAX_FRAME_PAYLOAD_LEN {
             bail!("payload too large: {}", payload.len());
         }
         let mut header = [0u8; 7];
@@ -681,7 +683,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
     loop {
         if control.is_cancelled() {
@@ -734,7 +736,7 @@ async fn pump_remote_to_client<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = vec![0u8; 64 * 1024];
+    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
     loop {
         if control.is_cancelled() {
@@ -780,7 +782,7 @@ async fn write_frame(
 }
 
 fn should_flush_frame(_cmd: u8, _payload_len: usize) -> bool {
-    true
+    !matches!(_cmd, CMD_PSH) || _payload_len <= SMALL_DATA_FRAME_FLUSH_THRESHOLD
 }
 
 fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
@@ -818,10 +820,15 @@ mod tests {
     }
 
     #[test]
-    fn flushes_every_frame() {
+    fn flushes_control_and_small_payload_frames() {
         assert!(should_flush_frame(CMD_SYNACK, 0));
         assert!(should_flush_frame(CMD_PSH, 1024));
-        assert!(should_flush_frame(CMD_PSH, 8192));
+        assert!(!should_flush_frame(CMD_PSH, 8192));
+    }
+
+    #[test]
+    fn caps_frame_payload_to_protocol_limit() {
+        assert_eq!(MAX_FRAME_PAYLOAD_LEN, u16::MAX as usize);
     }
 
     #[tokio::test]
