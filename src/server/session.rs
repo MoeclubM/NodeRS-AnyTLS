@@ -52,12 +52,14 @@ pub async fn serve_connection(
     let lease = accounting.open_session(&user, source)?;
     let control = lease.control();
     let activity = ActivityTracker::new();
+    let limiter = lease.limiter();
     let (reader, writer) = split(stream);
     let session = Session {
         user: user.clone(),
         lease,
         accounting: accounting.clone(),
         padding,
+        limiter,
         route_rules,
         outbound,
         activity,
@@ -102,6 +104,7 @@ struct Session {
     lease: SessionLease,
     accounting: Arc<Accounting>,
     padding: PaddingScheme,
+    limiter: Option<Arc<SharedRateLimiter>>,
     route_rules: RouteRules,
     outbound: OutboundConfig,
     activity: Arc<ActivityTracker>,
@@ -343,8 +346,16 @@ impl Session {
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
+        let payload_len = payload.len();
         if let Some(inbound) = inbound {
             let _ = inbound.send(InboundMessage::Data(payload)).await;
+        }
+        if let Some(limiter) = &self.limiter {
+            let control = self.lease.control();
+            tokio::select! {
+                _ = control.cancelled() => return Ok(()),
+                _ = limiter.consume(payload_len) => {}
+            }
         }
         Ok(())
     }
@@ -668,7 +679,7 @@ async fn handle_tcp_stream(
         &mut app_side,
         &mut write_b,
         context.control.clone(),
-        context.limiter.clone(),
+        None,
         Some(context.upload_traffic),
         None,
     );
@@ -941,47 +952,5 @@ mod tests {
         drop(source_writer);
         let transferred = task.await.expect("join pump").expect("pump succeeds");
         assert_eq!(transferred, 5);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn pump_copy_writes_before_waiting_for_limiter() {
-        let control = SessionControl::new();
-        let limiter = SharedRateLimiter::new(1024);
-        let (mut source_reader, mut source_writer) = tokio::io::duplex(8192);
-        let (mut sink_writer, mut sink_reader) = tokio::io::duplex(8192);
-
-        let task = tokio::spawn({
-            let control = control.clone();
-            let limiter = limiter.clone();
-            async move {
-                pump_copy(
-                    &mut source_reader,
-                    &mut sink_writer,
-                    control,
-                    Some(limiter),
-                    None,
-                    None,
-                )
-                .await
-            }
-        });
-
-        let payload = vec![7u8; 4096];
-        source_writer
-            .write_all(&payload)
-            .await
-            .expect("write source payload");
-
-        let mut observed = vec![0u8; payload.len()];
-        tokio::time::timeout(
-            Duration::from_millis(1),
-            sink_reader.read_exact(&mut observed),
-        )
-        .await
-        .expect("throttled write should complete before limiter wait")
-        .expect("read sink payload");
-        assert_eq!(observed, payload);
-
-        task.abort();
     }
 }

@@ -150,7 +150,7 @@ impl PreparedUotRelay {
             socket: self.socket.clone(),
             mode: self.mode.clone(),
             control: control.clone(),
-            limiter: limiter.clone(),
+            limiter: None,
             traffic: upload,
         };
         let server_context = UdpRelayContext {

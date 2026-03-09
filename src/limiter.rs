@@ -1,6 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+const MAX_THROTTLE_WAIT: Duration = Duration::from_millis(100);
+
 #[derive(Debug)]
 pub struct SharedRateLimiter {
     state: Mutex<BucketState>,
@@ -54,8 +56,13 @@ impl SharedRateLimiter {
             }
 
             let start = state.available_at.max(now);
-            let wait = start.saturating_duration_since(now);
+            let scheduled_wait = start.saturating_duration_since(now);
+            let mut wait = scheduled_wait;
             state.available_at = start + reserve_duration(bytes, state.bytes_per_second);
+            if wait > MAX_THROTTLE_WAIT {
+                wait = MAX_THROTTLE_WAIT;
+                state.available_at = now + wait;
+            }
             wait
         };
 
@@ -70,9 +77,9 @@ fn recommended_chunk_size(bytes_per_second: u64, max_bytes: usize) -> usize {
         return max_bytes.max(1);
     }
     let capped_max = max_bytes.max(1) as u64;
-    let minimum = capped_max.min(4 * 1024);
-    let suggested = (bytes_per_second / 20).max(minimum);
-    suggested.min(capped_max) as usize
+    let minimum = capped_max.min(64);
+    let per_window = ((bytes_per_second as f64) * MAX_THROTTLE_WAIT.as_secs_f64()).ceil() as u64;
+    per_window.max(minimum).min(capped_max) as usize
 }
 
 fn reserve_duration(bytes: usize, bytes_per_second: u64) -> Duration {
@@ -111,7 +118,7 @@ mod tests {
     #[test]
     fn scales_chunk_size_with_rate() {
         let limiter = SharedRateLimiter::new(125 * 1024);
-        assert_eq!(limiter.chunk_size(64 * 1024), 6_400);
+        assert_eq!(limiter.chunk_size(64 * 1024), 12_800);
         assert_eq!(limiter.chunk_size(2 * 1024), 2 * 1024);
 
         limiter.set_rate(10 * 1024 * 1024);
