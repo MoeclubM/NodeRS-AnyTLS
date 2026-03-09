@@ -12,7 +12,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::config::OutboundConfig;
@@ -124,21 +124,7 @@ struct StreamState {
 
 #[derive(Clone)]
 struct FrameWriter {
-    control_tx: mpsc::Sender<FrameMessage>,
-    data_tx: mpsc::Sender<FrameMessage>,
-}
-
-struct FrameMessage {
-    cmd: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
-    flush: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FramePriority {
-    Control,
-    Data,
+    inner: Arc<Mutex<WriteHalf<TlsStream>>>,
 }
 
 enum InboundMessage {
@@ -178,16 +164,8 @@ struct TcpStreamContext {
 
 impl FrameWriter {
     fn spawn(writer: WriteHalf<TlsStream>) -> Self {
-        let (control_tx, control_rx) = mpsc::channel(128);
-        let (data_tx, data_rx) = mpsc::channel(512);
-        tokio::spawn(async move {
-            if let Err(error) = frame_writer_loop(writer, control_rx, data_rx).await {
-                debug!(%error, "session writer loop exited with error");
-            }
-        });
         Self {
-            control_tx,
-            data_tx,
+            inner: Arc::new(Mutex::new(writer)),
         }
     }
 
@@ -195,18 +173,25 @@ impl FrameWriter {
         if payload.len() > u16::MAX as usize {
             bail!("payload too large: {}", payload.len());
         }
-        let tx = match frame_priority(cmd) {
-            FramePriority::Control => &self.control_tx,
-            FramePriority::Data => &self.data_tx,
-        };
-        tx.send(FrameMessage {
-            cmd,
-            stream_id,
-            payload: payload.to_vec(),
-            flush: should_flush_frame(cmd, payload.len()),
-        })
-        .await
-        .map_err(|_| anyhow!("session writer closed"))
+        let mut header = [0u8; 7];
+        header[0] = cmd;
+        header[1..5].copy_from_slice(&stream_id.to_be_bytes());
+        header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        let mut writer = self.inner.lock().await;
+        writer
+            .write_all(&header)
+            .await
+            .context("write session frame header")?;
+        if !payload.is_empty() {
+            writer
+                .write_all(payload)
+                .await
+                .context("write session frame payload")?;
+        }
+        if should_flush_frame(cmd, payload.len()) {
+            writer.flush().await.context("flush session frame")?;
+        }
+        Ok(())
     }
 }
 
@@ -794,67 +779,8 @@ async fn write_frame(
     writer.send(cmd, stream_id, payload).await
 }
 
-async fn frame_writer_loop(
-    mut writer: WriteHalf<TlsStream>,
-    mut control_rx: mpsc::Receiver<FrameMessage>,
-    mut data_rx: mpsc::Receiver<FrameMessage>,
-) -> anyhow::Result<()> {
-    loop {
-        let frame = tokio::select! {
-            biased;
-            frame = control_rx.recv() => match frame {
-                Some(frame) => frame,
-                None => match data_rx.recv().await {
-                    Some(frame) => frame,
-                    None => break,
-                },
-            },
-            frame = data_rx.recv() => match frame {
-                Some(frame) => frame,
-                None => match control_rx.recv().await {
-                    Some(frame) => frame,
-                    None => break,
-                },
-            },
-        };
-        let payload_len = frame.payload.len();
-        if payload_len > u16::MAX as usize {
-            bail!("payload too large: {payload_len}");
-        }
-        let mut header = [0u8; 7];
-        header[0] = frame.cmd;
-        header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
-        header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
-        writer
-            .write_all(&header)
-            .await
-            .context("write session frame header")?;
-        if !frame.payload.is_empty() {
-            writer
-                .write_all(&frame.payload)
-                .await
-                .context("write session frame payload")?;
-        }
-        if frame.flush {
-            writer.flush().await.context("flush session frame")?;
-        }
-    }
-    Ok(())
-}
-
-fn frame_priority(cmd: u8) -> FramePriority {
-    if cmd == CMD_PSH {
-        FramePriority::Data
-    } else {
-        FramePriority::Control
-    }
-}
-
-fn should_flush_frame(cmd: u8, payload_len: usize) -> bool {
-    match frame_priority(cmd) {
-        FramePriority::Control => true,
-        FramePriority::Data => payload_len <= 4096,
-    }
+fn should_flush_frame(_cmd: u8, _payload_len: usize) -> bool {
+    true
 }
 
 fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
@@ -892,17 +818,10 @@ mod tests {
     }
 
     #[test]
-    fn prioritizes_control_frames_over_payload_frames() {
-        assert_eq!(frame_priority(CMD_PSH), FramePriority::Data);
-        assert_eq!(frame_priority(CMD_SYNACK), FramePriority::Control);
-        assert_eq!(frame_priority(CMD_FIN), FramePriority::Control);
-    }
-
-    #[test]
-    fn flushes_control_and_small_payload_frames() {
+    fn flushes_every_frame() {
         assert!(should_flush_frame(CMD_SYNACK, 0));
         assert!(should_flush_frame(CMD_PSH, 1024));
-        assert!(!should_flush_frame(CMD_PSH, 8192));
+        assert!(should_flush_frame(CMD_PSH, 8192));
     }
 
     #[tokio::test]
