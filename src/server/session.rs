@@ -40,9 +40,9 @@ const CMD_HEART_RESPONSE: u8 = 9;
 const CMD_SERVER_SETTINGS: u8 = 10;
 const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
-const UPLOAD_BATCH_SIZE: usize = 256 * 1024;
+const UPLOAD_BATCH_SIZE: usize = 128 * 1024;
 const UPLOAD_BATCH_IOVECS: usize = 32;
-const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
+const STREAM_INBOUND_QUEUE_CAPACITY: usize = 2048;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
