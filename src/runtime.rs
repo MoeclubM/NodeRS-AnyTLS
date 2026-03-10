@@ -2,7 +2,7 @@ use anyhow::Context;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::{Duration, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::accounting::Accounting;
 use crate::acme;
@@ -87,7 +87,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                 Ok(FetchState::Modified(users, etag)) => {
                     user_etag = etag;
                     sync_accounting.replace_users(&users.users);
-                    info!(count = users.users.len(), "users updated");
+                    debug!(count = users.users.len(), "users updated");
                 }
                 Ok(FetchState::NotModified) => {}
                 Err(error) => warn!(%error, "user sync failed"),
@@ -98,7 +98,7 @@ pub async fn run(config: AppConfig) -> anyhow::Result<()> {
                     let alive_count = alive_list.alive.len();
                     sync_accounting.set_external_alive_counts(&alive_list.alive);
                     if alive_count > 0 {
-                        info!(alive_count, "panel alive list fetched");
+                        debug!(alive_count, "panel alive list fetched");
                     }
                 }
                 Err(error) => warn!(%error, "alive list fetch failed"),

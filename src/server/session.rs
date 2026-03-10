@@ -1,6 +1,7 @@
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use md5::{Digest as Md5Digest, Md5};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::io::IoSlice;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::accounting::{Accounting, SessionControl, SessionLease, UserEntry};
 use crate::config::OutboundConfig;
@@ -40,6 +41,8 @@ const CMD_SERVER_SETTINGS: u8 = 10;
 const MAX_FRAME_PAYLOAD_LEN: usize = u16::MAX as usize;
 const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
 const UPLOAD_BATCH_SIZE: usize = 256 * 1024;
+const UPLOAD_BATCH_IOVECS: usize = 32;
+const STREAM_INBOUND_QUEUE_CAPACITY: usize = 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
@@ -181,16 +184,7 @@ impl FrameWriter {
         header[1..5].copy_from_slice(&stream_id.to_be_bytes());
         header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         let mut writer = self.inner.lock().await;
-        writer
-            .write_all(&header)
-            .await
-            .context("write session frame header")?;
-        if !payload.is_empty() {
-            writer
-                .write_all(payload)
-                .await
-                .context("write session frame payload")?;
-        }
+        write_frame_parts(&mut *writer, &header, payload).await?;
         if should_flush_frame(cmd, payload.len()) {
             writer.flush().await.context("flush session frame")?;
         }
@@ -373,7 +367,7 @@ impl Session {
             state.peer_version
         };
 
-        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+        let (inbound_tx, inbound_rx) = mpsc::channel(STREAM_INBOUND_QUEUE_CAPACITY);
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
@@ -585,7 +579,7 @@ async fn handle_stream(
                         .await?;
                     bridge_task.abort();
                     outbound_task.abort();
-                    info!(stream_id, user = %user.uuid, version = ?version, "UOT stream closed");
+                    debug!(stream_id, user = %user.uuid, version = ?version, "UOT stream closed");
                     Ok(())
                 }
                 Err(error) => {
@@ -663,7 +657,7 @@ async fn handle_stream(
     .await;
 
     result.map(|(uploaded, downloaded)| {
-        info!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
+        debug!(stream_id, user = %user.uuid, destination = %destination, uploaded, downloaded, "stream closed");
     })
 }
 
@@ -705,21 +699,28 @@ async fn pump_inbound_to_remote<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = Vec::with_capacity(UPLOAD_BATCH_SIZE);
+    let mut chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(UPLOAD_BATCH_IOVECS);
+    let mut front_offset = 0usize;
+    let mut queued_bytes = 0usize;
     let mut total = 0u64;
     loop {
         if control.is_cancelled() {
             return Ok(total);
         }
         if !pending.is_empty() {
-            buffer.extend_from_slice(&pending);
-            pending.clear();
+            queued_bytes += pending.len();
+            chunks.push_back(std::mem::take(&mut pending));
+            front_offset = 0;
         }
-        while buffer.len() < UPLOAD_BATCH_SIZE && !finished {
+        while queued_bytes < UPLOAD_BATCH_SIZE && chunks.len() < UPLOAD_BATCH_IOVECS && !finished {
             match rx.try_recv() {
                 Ok(InboundMessage::Data(chunk)) => {
-                    if buffer.is_empty() || buffer.len() + chunk.len() <= UPLOAD_BATCH_SIZE {
-                        buffer.extend_from_slice(&chunk);
+                    if chunks.is_empty()
+                        || (queued_bytes + chunk.len() <= UPLOAD_BATCH_SIZE
+                            && chunks.len() < UPLOAD_BATCH_IOVECS)
+                    {
+                        queued_bytes += chunk.len();
+                        chunks.push_back(chunk);
                     } else {
                         pending = chunk;
                         break;
@@ -736,7 +737,7 @@ where
                 }
             }
         }
-        if buffer.is_empty() {
+        if chunks.is_empty() {
             if finished {
                 let _ = writer.shutdown().await;
                 return Ok(total);
@@ -755,19 +756,19 @@ where
                 }
             }
         }
-        tokio::select! {
+        let written = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            result = writer.write_all(&buffer) => {
-                result.context("write throttled chunk")?;
-            }
-        }
-        let transferred = buffer.len() as u64;
+            result = write_chunk_batch(writer, &chunks, front_offset) => result?,
+        };
+        ensure!(written > 0, "write inbound batch returned zero bytes");
+        advance_chunk_batch(&mut chunks, &mut front_offset, written);
+        queued_bytes = queued_bytes.saturating_sub(written);
+        let transferred = written as u64;
         total += transferred;
         if let Some(traffic) = traffic.as_ref() {
             traffic.record(transferred);
         }
-        buffer.clear();
-        if finished && pending.is_empty() {
+        if finished && pending.is_empty() && chunks.is_empty() {
             let _ = writer.shutdown().await;
             return Ok(total);
         }
@@ -884,6 +885,130 @@ async fn write_frame(
     writer.send(cmd, stream_id, payload).await
 }
 
+async fn write_chunk_batch<W>(
+    writer: &mut W,
+    chunks: &VecDeque<Vec<u8>>,
+    front_offset: usize,
+) -> anyhow::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    if writer.is_write_vectored() {
+        let slices = chunk_batch_slices(chunks, front_offset);
+        if slices.is_empty() {
+            return Ok(0);
+        }
+        return writer
+            .write_vectored(&slices)
+            .await
+            .context("write inbound chunk batch");
+    }
+
+    let Some(front) = chunks.front() else {
+        return Ok(0);
+    };
+    writer
+        .write(&front[front_offset..])
+        .await
+        .context("write inbound chunk")
+}
+
+async fn write_frame_parts<W>(
+    writer: &mut W,
+    header: &[u8; 7],
+    payload: &[u8],
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut header_offset = 0usize;
+    let mut payload_offset = 0usize;
+    while header_offset < header.len() || payload_offset < payload.len() {
+        let written = if writer.is_write_vectored() {
+            let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
+            let mut count = 0usize;
+            if header_offset < header.len() {
+                slices[count] = IoSlice::new(&header[header_offset..]);
+                count += 1;
+            }
+            if payload_offset < payload.len() {
+                slices[count] = IoSlice::new(&payload[payload_offset..]);
+                count += 1;
+            }
+            writer
+                .write_vectored(&slices[..count])
+                .await
+                .context("write session frame")?
+        } else if header_offset < header.len() {
+            writer
+                .write(&header[header_offset..])
+                .await
+                .context("write session frame header")?
+        } else {
+            writer
+                .write(&payload[payload_offset..])
+                .await
+                .context("write session frame payload")?
+        };
+        ensure!(written > 0, "write session frame returned zero bytes");
+        if header_offset < header.len() {
+            let header_remaining = header.len() - header_offset;
+            let header_written = written.min(header_remaining);
+            header_offset += header_written;
+            payload_offset += written - header_written;
+        } else {
+            payload_offset += written;
+        }
+    }
+    Ok(())
+}
+
+fn chunk_batch_slices(chunks: &VecDeque<Vec<u8>>, front_offset: usize) -> Vec<IoSlice<'_>> {
+    let mut slices = Vec::with_capacity(chunks.len().min(UPLOAD_BATCH_IOVECS));
+    let mut remaining = UPLOAD_BATCH_SIZE;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if slices.len() >= UPLOAD_BATCH_IOVECS || remaining == 0 {
+            break;
+        }
+        let slice = if index == 0 {
+            &chunk[front_offset..]
+        } else {
+            chunk.as_slice()
+        };
+        if slice.is_empty() {
+            continue;
+        }
+        let used = slice.len().min(remaining);
+        slices.push(IoSlice::new(&slice[..used]));
+        remaining -= used;
+    }
+    slices
+}
+
+fn advance_chunk_batch(
+    chunks: &mut VecDeque<Vec<u8>>,
+    front_offset: &mut usize,
+    mut written: usize,
+) {
+    while written > 0 {
+        let Some(front) = chunks.front() else {
+            *front_offset = 0;
+            break;
+        };
+        let remaining = front.len().saturating_sub(*front_offset);
+        if written < remaining {
+            *front_offset += written;
+            break;
+        }
+        written -= remaining;
+        chunks.pop_front();
+        *front_offset = 0;
+    }
+}
+
 fn should_flush_frame(_cmd: u8, _payload_len: usize) -> bool {
     !matches!(_cmd, CMD_PSH) || _payload_len <= SMALL_DATA_FRAME_FLUSH_THRESHOLD
 }
@@ -989,5 +1114,24 @@ mod tests {
             .await
             .expect("read combined chunk");
         assert_eq!(&buf, b"helloworld");
+    }
+
+    #[test]
+    fn advance_chunk_batch_handles_partial_write() {
+        let mut chunks = VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let mut front_offset = 0;
+        advance_chunk_batch(&mut chunks, &mut front_offset, 7);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(front_offset, 2);
+        assert_eq!(&chunks.front().expect("remaining chunk")[..], b"world");
+    }
+
+    #[test]
+    fn chunk_batch_slices_respects_front_offset() {
+        let chunks = VecDeque::from([b"hello".to_vec(), b"world".to_vec()]);
+        let slices = chunk_batch_slices(&chunks, 2);
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].len(), 3);
+        assert_eq!(slices[1].len(), 5);
     }
 }

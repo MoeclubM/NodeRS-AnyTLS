@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::net::UdpSocket;
-use tracing::warn;
+use tracing::debug;
 
 use crate::accounting::SessionControl;
 use crate::config::OutboundConfig;
@@ -200,7 +200,7 @@ async fn relay_client_to_udp(
             return Ok(());
         };
         if route_rules.is_blocked(&packet.destination, "udp") {
-            warn!(destination = %packet.destination, "dropping blocked UOT packet");
+            debug!(destination = %packet.destination, "dropping blocked UOT packet");
             continue;
         }
         let sent = match &context.mode {
