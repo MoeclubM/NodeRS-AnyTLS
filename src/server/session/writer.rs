@@ -5,7 +5,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::Mutex;
 
 use super::TlsStream;
-use super::frame::{MAX_FRAME_PAYLOAD_LEN, SMALL_DATA_FRAME_FLUSH_THRESHOLD, should_flush_frame};
+use super::frame::{COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, should_flush_frame};
 
 #[derive(Clone)]
 pub(super) struct FrameWriter {
@@ -28,8 +28,8 @@ impl FrameWriter {
         header[1..5].copy_from_slice(&stream_id.to_be_bytes());
         header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
         let mut writer = self.inner.lock().await;
-        if payload.len() <= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
-            let mut buffer = [0u8; 7 + SMALL_DATA_FRAME_FLUSH_THRESHOLD];
+        if payload.len() <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
+            let mut buffer = [0u8; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
             buffer[..7].copy_from_slice(&header);
             buffer[7..7 + payload.len()].copy_from_slice(payload);
             writer
