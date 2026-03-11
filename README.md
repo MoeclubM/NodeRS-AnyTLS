@@ -46,6 +46,21 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
   --server-name node.example.com
 ```
 
+### Generate a self-signed certificate
+
+If you want the installer to generate a local self-signed certificate instead of using ACME or pre-existing files, pass `--self-signed`. The certificate CN and SAN use `--server-name` when provided, otherwise they fall back to the node `server_name` fetched from Xboard.
+
+This mode requires `openssl` on the target Linux host.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/install.sh | bash -s -- \
+  --panel-url https://api.example.com \
+  --panel-token server_token \
+  --node-id 1 \
+  --server-name node.example.com \
+  --self-signed
+```
+
 ### Use existing certificate files
 
 If you already have a certificate and key, pass both paths. In this mode the installer writes those paths into the config and does not enable ACME.

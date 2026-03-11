@@ -14,6 +14,8 @@ ACME_CHALLENGE_LISTEN="[::]:80"
 TLS_SERVER_NAME=""
 DNS_RESOLVER="system"
 IP_STRATEGY="system"
+SELF_SIGNED=0
+SELF_SIGNED_DAYS=3650
 NO_SERVICE=0
 UNINSTALL=0
 REMOVE_ALL=0
@@ -57,6 +59,8 @@ Options:
   --node-id <id>              Single-node Xboard node id
   --xboard <url> <token> <id> Add one Xboard node triplet; may be repeated
   --server-name <fqdn>        Override local tls.server_name and auto-issue ACME for it
+  --self-signed               Generate a self-signed certificate per node and disable ACME
+  --self-signed-days <days>   Validity for generated self-signed certs, default: 3650
   --cert-file <path>          Use an existing certificate file and disable ACME
   --key-file <path>           Use an existing private key file and disable ACME
   --acme-email <mailbox>      Contact email for ACME account registration
@@ -72,6 +76,7 @@ Options:
 Examples:
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --server-name node.example.com
+  bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --self-signed --server-name node.example.com
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 1 --cert-file /path/fullchain.pem --key-file /path/privkey.pem
   bash install.sh --xboard https://api.example.com tokenA 1 --xboard https://api.example.com tokenB 2
   bash install.sh --panel-url https://api.example.com --panel-token token --node-id 171 --uninstall
@@ -150,6 +155,14 @@ parse_args() {
         TLS_SERVER_NAME="$2"
         shift 2
         ;;
+      --self-signed)
+        SELF_SIGNED=1
+        shift
+        ;;
+      --self-signed-days)
+        SELF_SIGNED_DAYS="$2"
+        shift 2
+        ;;
       --dns-resolver)
         DNS_RESOLVER="$2"
         shift 2
@@ -209,6 +222,20 @@ validate_args() {
       echo "Private key file not found: $KEY_PATH" >&2
       exit 1
     fi
+  fi
+
+  if [[ "$SELF_SIGNED" -eq 1 && ( -n "$CERT_PATH" || -n "$KEY_PATH" ) ]]; then
+    echo "--self-signed cannot be used together with --cert-file/--key-file." >&2
+    exit 1
+  fi
+
+  [[ "$SELF_SIGNED_DAYS" =~ ^[0-9]+$ ]] || {
+    echo "--self-signed-days must be a positive integer." >&2
+    exit 1
+  }
+  if [[ "$SELF_SIGNED_DAYS" -lt 1 ]]; then
+    echo "--self-signed-days must be at least 1." >&2
+    exit 1
   fi
 
   if [[ "$UNINSTALL" -eq 1 ]]; then
@@ -381,8 +408,51 @@ node_account_key_path() {
   printf '%s\n' "${CONFIG_DIR%/}/acme-account-${1}.pem"
 }
 
+node_self_signed_cert_path() {
+  printf '%s\n' "${CONFIG_DIR%/}/selfsigned-cert-${1}.pem"
+}
+
+node_self_signed_key_path() {
+  printf '%s\n' "${CONFIG_DIR%/}/selfsigned-key-${1}.pem"
+}
+
 node_config_path() {
   printf '%s\n' "${CONFIG_DIR%/}/nodes/${1}.toml"
+}
+
+generate_self_signed_certificate() {
+  local server_name cert_path key_path tmp_config cert_dir
+  server_name="$1"
+  cert_path="$2"
+  key_path="$3"
+  cert_dir="$(dirname "$cert_path")"
+
+  need_cmd openssl
+  install -d "$cert_dir"
+  tmp_config="$(mktemp)"
+  trap 'rm -f "$tmp_config"' RETURN
+  cat > "$tmp_config" <<EOF
+[req]
+distinguished_name = req_dn
+x509_extensions = v3_req
+prompt = no
+
+[req_dn]
+CN = $server_name
+
+[v3_req]
+subjectAltName = DNS:$server_name
+EOF
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -days "$SELF_SIGNED_DAYS" \
+    -config "$tmp_config" \
+    -extensions v3_req \
+    -keyout "$key_path" \
+    -out "$cert_path" >/dev/null 2>&1
+  trap - RETURN
+  rm -f "$tmp_config"
+  chmod 600 "$key_path"
+  chmod 644 "$cert_path"
 }
 
 determine_tls_settings() {
@@ -409,6 +479,14 @@ determine_tls_settings() {
     echo "Unable to discover server_name for node $node_id; pass --server-name explicitly or configure Xboard server_name." >&2
     exit 1
   }
+
+  if [[ "$SELF_SIGNED" -eq 1 ]]; then
+    cert_path="$(node_self_signed_cert_path "$node_id")"
+    key_path="$(node_self_signed_key_path "$node_id")"
+    generate_self_signed_certificate "$selected_server_name" "$cert_path" "$key_path"
+    printf '%s|%s|%s|false|node.example.com|%s\n' "$cert_path" "$key_path" "$selected_server_name" "$account_key_path"
+    return
+  fi
 
   cert_path="$(node_cert_path "$node_id")"
   key_path="$(node_key_path "$node_id")"
@@ -519,7 +597,7 @@ stop_disable_unit() {
 }
 
 remove_single_node() {
-  local node_id config_path cert_path key_path legacy_cert_path legacy_key_path account_key_path unit_name
+  local node_id config_path cert_path key_path legacy_cert_path legacy_key_path account_key_path self_signed_cert_path self_signed_key_path unit_name
   node_id="$1"
   config_path="$(node_config_path "$node_id")"
   cert_path="$(node_cert_path "$node_id")"
@@ -527,10 +605,12 @@ remove_single_node() {
   legacy_cert_path="${CONFIG_DIR%/}/cert-${node_id}.pem"
   legacy_key_path="${CONFIG_DIR%/}/key-${node_id}.pem"
   account_key_path="$(node_account_key_path "$node_id")"
+  self_signed_cert_path="$(node_self_signed_cert_path "$node_id")"
+  self_signed_key_path="$(node_self_signed_key_path "$node_id")"
   unit_name="${SERVICE_NAME}-${node_id}"
 
   stop_disable_unit "$unit_name"
-  rm -f "$config_path" "$cert_path" "$key_path" "$legacy_cert_path" "$legacy_key_path" "$account_key_path"
+  rm -f "$config_path" "$cert_path" "$key_path" "$legacy_cert_path" "$legacy_key_path" "$account_key_path" "$self_signed_cert_path" "$self_signed_key_path"
 }
 
 remove_all_nodes() {
@@ -572,12 +652,19 @@ uninstall() {
 }
 
 print_summary() {
-  local service_unit
+  local service_unit tls_summary
+  if [[ "$SELF_SIGNED" -eq 1 ]]; then
+    tls_summary="Self-signed certificates generated locally from --server-name or Xboard server_name"
+  elif [[ -n "$CERT_PATH" && -n "$KEY_PATH" ]]; then
+    tls_summary="Using existing certificate files from --cert-file/--key-file"
+  else
+    tls_summary="Auto ACME from local --server-name or Xboard server_name"
+  fi
   cat <<EOF
 Installed NodeRS-AnyTLS
   Binary: $PREFIX/bin/noders-anytls
   State:  $STATE_DIR
-  TLS:    Auto ACME from local --server-name or Xboard server_name unless --cert-file/--key-file is supplied
+  TLS:    $tls_summary
 EOF
 
   for config_path in "${GENERATED_CONFIGS[@]}"; do
