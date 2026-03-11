@@ -702,7 +702,8 @@ mod tests {
         let medium = upload_batch_policy(8 * 1024);
         let large = upload_batch_policy(32 * 1024);
         assert!(small.max_iovecs > medium.max_iovecs);
-        assert_eq!(medium.max_iovecs, large.max_iovecs);
+        assert!(large.max_iovecs < medium.max_iovecs);
+        assert!(large.max_bytes > medium.max_bytes);
         assert!(download_coalesce_target(1024).is_some());
         assert!(download_coalesce_target(8 * 1024).is_none());
         assert!(download_coalesce_target(32 * 1024).is_none());

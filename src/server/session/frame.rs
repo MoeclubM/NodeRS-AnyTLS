@@ -19,8 +19,10 @@ pub(super) const MEDIUM_PAYLOAD_LEN: usize = 16 * 1024;
 pub(super) const SMALL_DATA_FRAME_FLUSH_THRESHOLD: usize = 4 * 1024;
 pub(super) const SMALL_DOWNLOAD_COALESCE_TARGET: usize = 24 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
+pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 160 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 96;
+pub(super) const LARGE_UPLOAD_BATCH_IOVECS: usize = 40;
 pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
@@ -68,9 +70,13 @@ pub(super) fn upload_batch_policy(first_chunk_len: usize) -> UploadBatchPolicy {
             max_bytes: SMALL_UPLOAD_BATCH_SIZE,
             max_iovecs: SMALL_UPLOAD_BATCH_IOVECS,
         },
-        PayloadTier::Medium | PayloadTier::Large => UploadBatchPolicy {
+        PayloadTier::Medium => UploadBatchPolicy {
             max_bytes: DEFAULT_UPLOAD_BATCH_SIZE,
             max_iovecs: DEFAULT_UPLOAD_BATCH_IOVECS,
+        },
+        PayloadTier::Large => UploadBatchPolicy {
+            max_bytes: LARGE_UPLOAD_BATCH_SIZE,
+            max_iovecs: LARGE_UPLOAD_BATCH_IOVECS,
         },
     }
 }
