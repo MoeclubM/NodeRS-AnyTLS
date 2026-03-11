@@ -25,7 +25,7 @@ use super::socksaddr::SocksAddr;
 use super::traffic::TrafficRecorder;
 use super::transport;
 use super::uot;
-use channel::ChannelReader;
+use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
@@ -37,6 +37,7 @@ use writer::{FrameWriter, write_frame};
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PAYLOAD_POOL_MAX_CACHED: usize = 512;
 
 pub async fn serve_connection(
     mut stream: TlsStream,
@@ -67,6 +68,7 @@ pub async fn serve_connection(
         reader,
         writer: FrameWriter::spawn(writer),
         state: Arc::new(SessionState::default()),
+        payload_pool: Arc::new(PayloadPool::new(PAYLOAD_POOL_MAX_CACHED)),
     };
     let result = session.run().await;
     if control.is_cancelled() {
@@ -111,6 +113,7 @@ struct Session {
     reader: ReadHalf<TlsStream>,
     writer: FrameWriter,
     state: Arc<SessionState>,
+    payload_pool: Arc<PayloadPool>,
 }
 
 struct SessionState {
@@ -223,9 +226,9 @@ impl Session {
     }
 
     async fn handle_psh(&mut self, header: FrameHeader) -> anyhow::Result<()> {
-        let mut payload = vec![0u8; header.length as usize];
+        let mut payload = self.payload_pool.take(header.length as usize);
         self.reader
-            .read_exact(&mut payload)
+            .read_exact(payload.as_mut_slice())
             .await
             .context("read PSH payload")?;
 
@@ -418,15 +421,16 @@ impl Session {
     async fn forward_inbound_payload(
         &self,
         inbound: channel::InboundSender,
-        payload: Vec<u8>,
+        payload: PayloadBuffer,
     ) -> anyhow::Result<()> {
         if payload.len() <= LARGE_INBOUND_SEGMENT_LEN {
             return self.forward_inbound_segment(&inbound, payload).await;
         }
 
         let segment_len = inbound_segment_len(payload.len());
+        let payload = payload.into_vec();
         for segment in payload.chunks(segment_len) {
-            self.forward_inbound_segment(&inbound, segment.to_vec())
+            self.forward_inbound_segment(&inbound, PayloadBuffer::new(segment.to_vec()))
                 .await?;
         }
         Ok(())
@@ -435,7 +439,7 @@ impl Session {
     async fn forward_inbound_segment(
         &self,
         inbound: &channel::InboundSender,
-        payload: Vec<u8>,
+        payload: PayloadBuffer,
     ) -> anyhow::Result<()> {
         match inbound.try_send_data(payload) {
             Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
