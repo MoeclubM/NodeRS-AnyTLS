@@ -6,10 +6,10 @@ mod writer;
 use anyhow::{Context, anyhow, bail};
 use rustc_hash::FxHashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, ReadHalf, split};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
@@ -66,7 +66,7 @@ pub async fn serve_connection(
         activity,
         reader,
         writer: FrameWriter::spawn(writer),
-        state: Arc::new(Mutex::new(SessionState::default())),
+        state: Arc::new(SessionState::default()),
     };
     let result = session.run().await;
     if control.is_cancelled() {
@@ -110,14 +110,23 @@ struct Session {
     activity: Arc<ActivityTracker>,
     reader: ReadHalf<TlsStream>,
     writer: FrameWriter,
-    state: Arc<Mutex<SessionState>>,
+    state: Arc<SessionState>,
 }
 
-#[derive(Default)]
 struct SessionState {
-    received_settings: bool,
-    peer_version: u8,
-    streams: FxHashMap<u32, StreamState>,
+    received_settings: AtomicBool,
+    peer_version: AtomicU8,
+    streams: RwLock<FxHashMap<u32, StreamState>>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            received_settings: AtomicBool::new(false),
+            peer_version: AtomicU8::new(0),
+            streams: RwLock::new(FxHashMap::default()),
+        }
+    }
 }
 
 struct StreamState {
@@ -166,7 +175,7 @@ impl Session {
                     if idle_for >= SESSION_IDLE_TIMEOUT {
                         break Err(anyhow!("session idle timeout"));
                     }
-                    if idle_for >= HEARTBEAT_INTERVAL && can_send_heartbeat(&state).await {
+                    if idle_for >= HEARTBEAT_INTERVAL && can_send_heartbeat(&state) {
                         write_frame(&writer, CMD_HEART_REQUEST, 0, &[]).await?;
                     }
                     continue;
@@ -206,10 +215,8 @@ impl Session {
     }
 
     async fn shutdown(&self) {
-        let streams = {
-            let mut state = self.state.lock().await;
-            std::mem::take(&mut state.streams)
-        };
+        let streams =
+            std::mem::take(&mut *self.state.streams.write().expect("streams lock poisoned"));
         for (_, stream) in streams {
             stream.task.abort();
         }
@@ -223,9 +230,8 @@ impl Session {
             .context("read PSH payload")?;
 
         let inbound = {
-            let state = self.state.lock().await;
-            state
-                .streams
+            let streams = self.state.streams.read().expect("streams lock poisoned");
+            streams
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
@@ -244,24 +250,24 @@ impl Session {
     }
 
     async fn handle_syn(&self, stream_id: u32) -> anyhow::Result<()> {
-        let (received_settings, peer_version, exists, stream_count) = {
-            let state = self.state.lock().await;
-            (
-                state.received_settings,
-                state.peer_version,
-                state.streams.contains_key(&stream_id),
-                state.streams.len(),
-            )
-        };
+        let received_settings = self.state.received_settings.load(Ordering::Relaxed);
+        let peer_version = self.state.peer_version.load(Ordering::Relaxed);
         if !received_settings {
             self.write_frame(CMD_ALERT, 0, b"client did not send its settings")
                 .await?;
             bail!("AnyTLS client did not send settings before SYN")
         }
-        if exists {
+        let stream_gate = {
+            let streams = self.state.streams.read().expect("streams lock poisoned");
+            (
+                streams.contains_key(&stream_id),
+                streams.len() >= MAX_STREAMS_PER_SESSION,
+            )
+        };
+        if stream_gate.0 {
             return Ok(());
         }
-        if stream_count >= MAX_STREAMS_PER_SESSION {
+        if stream_gate.1 {
             let error = format!("too many concurrent streams: limit={MAX_STREAMS_PER_SESSION}");
             if peer_version >= 2 {
                 self.write_frame(CMD_SYNACK, stream_id, error.as_bytes())
@@ -295,28 +301,35 @@ impl Session {
             let outcome =
                 handle_stream(stream_id, ChannelReader::new(inbound_rx), user, context).await;
 
-            let _ = state.lock().await.streams.remove(&stream_id);
+            let _ = state
+                .streams
+                .write()
+                .expect("streams lock poisoned")
+                .remove(&stream_id);
 
             if let Err(error) = outcome {
                 warn!(%error, stream_id, "AnyTLS stream handler failed");
             }
         });
 
-        self.state.lock().await.streams.insert(
-            stream_id,
-            StreamState {
-                inbound: Some(inbound_tx),
-                task,
-            },
-        );
+        self.state
+            .streams
+            .write()
+            .expect("streams lock poisoned")
+            .insert(
+                stream_id,
+                StreamState {
+                    inbound: Some(inbound_tx),
+                    task,
+                },
+            );
         Ok(())
     }
 
     async fn handle_fin(&self, stream_id: u32) {
         let inbound = {
-            let mut state = self.state.lock().await;
-            state
-                .streams
+            let mut streams = self.state.streams.write().expect("streams lock poisoned");
+            streams
                 .get_mut(&stream_id)
                 .and_then(|stream| stream.inbound.take())
         };
@@ -326,10 +339,12 @@ impl Session {
     }
 
     async fn drop_stream(&self, stream_id: u32) {
-        let stream = {
-            let mut state = self.state.lock().await;
-            state.streams.remove(&stream_id)
-        };
+        let stream = self
+            .state
+            .streams
+            .write()
+            .expect("streams lock poisoned")
+            .remove(&stream_id);
         if let Some(stream) = stream {
             stream.task.abort();
             let _ = self.write_frame(CMD_FIN, stream_id, &[]).await;
@@ -343,14 +358,14 @@ impl Session {
             .await
             .context("read settings frame")?;
         let settings = parse_settings(&bytes);
-        {
-            let mut state = self.state.lock().await;
-            state.received_settings = true;
-            state.peer_version = settings
+        self.state.received_settings.store(true, Ordering::Relaxed);
+        self.state.peer_version.store(
+            settings
                 .get("v")
                 .and_then(|value| value.parse::<u8>().ok())
-                .unwrap_or_default();
-        }
+                .unwrap_or_default(),
+            Ordering::Relaxed,
+        );
 
         let md5_mismatch = settings
             .get("padding-md5")
@@ -435,8 +450,8 @@ impl Session {
     }
 }
 
-async fn can_send_heartbeat(state: &Arc<Mutex<SessionState>>) -> bool {
-    state.lock().await.received_settings
+fn can_send_heartbeat(state: &Arc<SessionState>) -> bool {
+    state.received_settings.load(Ordering::Relaxed)
 }
 
 async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHeader> {
