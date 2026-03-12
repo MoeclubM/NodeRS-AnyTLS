@@ -1,21 +1,35 @@
 use anyhow::{Context, bail, ensure};
+use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
-use super::frame::{COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, should_flush_frame};
+use super::frame::{
+    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, should_flush_frame,
+};
+
+const MAX_PENDING_COMPACT_FRAMES: usize = 64;
+
+type PendingResultSender = oneshot::Sender<anyhow::Result<()>>;
+
+struct PendingCompactFrame {
+    buffer: Box<[u8]>,
+    done: PendingResultSender,
+}
 
 #[derive(Clone)]
 pub(super) struct FrameWriter {
     inner: Arc<Mutex<WriteHalf<TlsStream>>>,
+    pending_compact: Arc<std::sync::Mutex<VecDeque<PendingCompactFrame>>>,
 }
 
 impl FrameWriter {
     pub(super) fn spawn(writer: WriteHalf<TlsStream>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(writer)),
+            pending_compact: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         }
     }
 
@@ -27,18 +41,39 @@ impl FrameWriter {
         header[0] = cmd;
         header[1..5].copy_from_slice(&stream_id.to_be_bytes());
         header[5..7].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        if cmd == CMD_PSH && payload.len() <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
+            if let Ok(mut writer) = self.inner.try_lock() {
+                write_compact_frame(&mut *writer, &header, payload).await?;
+                drain_pending_compact_frames(&self.pending_compact, &mut *writer).await?;
+                if should_flush_frame(cmd, payload.len()) {
+                    writer.flush().await.context("flush session frame")?;
+                }
+                return Ok(());
+            }
+
+            let (done_tx, done_rx) = oneshot::channel();
+            enqueue_pending_compact_frame(
+                &self.pending_compact,
+                PendingCompactFrame {
+                    buffer: compact_frame_buffer(&header, payload).into_boxed_slice(),
+                    done: done_tx,
+                },
+            )?;
+
+            let mut writer = self.inner.lock().await;
+            drain_pending_compact_frames(&self.pending_compact, &mut *writer).await?;
+            drop(writer);
+            done_rx.await.context("await compact frame completion")??;
+            return Ok(());
+        }
+
         let mut writer = self.inner.lock().await;
         if payload.len() <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
-            let mut buffer = [0u8; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
-            buffer[..7].copy_from_slice(&header);
-            buffer[7..7 + payload.len()].copy_from_slice(payload);
-            writer
-                .write_all(&buffer[..7 + payload.len()])
-                .await
-                .context("write compact session frame")?;
+            write_compact_frame(&mut *writer, &header, payload).await?;
         } else {
             write_frame_parts(&mut *writer, &header, payload).await?;
         }
+        drain_pending_compact_frames(&self.pending_compact, &mut *writer).await?;
         if should_flush_frame(cmd, payload.len()) {
             writer.flush().await.context("flush session frame")?;
         }
@@ -53,6 +88,94 @@ pub(super) async fn write_frame(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     writer.send(cmd, stream_id, payload).await
+}
+
+fn enqueue_pending_compact_frame(
+    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    frame: PendingCompactFrame,
+) -> anyhow::Result<()> {
+    let mut guard = pending.lock().expect("pending compact queue poisoned");
+    if guard.len() >= MAX_PENDING_COMPACT_FRAMES {
+        bail!("pending compact frame queue full");
+    }
+    guard.push_back(frame);
+    Ok(())
+}
+
+async fn drain_pending_compact_frames<W>(
+    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    writer: &mut W,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let frames = {
+        let mut guard = pending.lock().expect("pending compact queue poisoned");
+        guard.drain(..).collect::<Vec<_>>()
+    };
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let write_result = write_compact_frame_batch(writer, &frames).await;
+    match write_result {
+        Ok(()) => {
+            for frame in frames {
+                let _ = frame.done.send(Ok(()));
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            for frame in frames {
+                let _ = frame.done.send(Err(anyhow::anyhow!(message.clone())));
+            }
+            return Err(error);
+        }
+    }
+    writer
+        .flush()
+        .await
+        .context("flush pending compact session frames")?;
+    Ok(())
+}
+
+async fn write_compact_frame<W>(
+    writer: &mut W,
+    header: &[u8; 7],
+    payload: &[u8],
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = [0u8; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
+    buffer[..7].copy_from_slice(header);
+    buffer[7..7 + payload.len()].copy_from_slice(payload);
+    writer
+        .write_all(&buffer[..7 + payload.len()])
+        .await
+        .context("write compact session frame")
+}
+
+fn compact_frame_buffer(header: &[u8; 7], payload: &[u8]) -> Vec<u8> {
+    let mut buffer = vec![0u8; 7 + payload.len()];
+    buffer[..7].copy_from_slice(header);
+    buffer[7..].copy_from_slice(payload);
+    buffer
+}
+
+async fn write_compact_frame_batch<W>(
+    writer: &mut W,
+    frames: &[PendingCompactFrame],
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    for frame in frames {
+        writer
+            .write_all(&frame.buffer)
+            .await
+            .context("write pending compact session frame")?;
+    }
+    Ok(())
 }
 
 async fn write_frame_parts<W>(
