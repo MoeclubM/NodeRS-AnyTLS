@@ -8,12 +8,19 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
 use super::frame::{
-    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, should_flush_frame,
+    CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, should_flush_frame,
 };
 
 const MAX_PENDING_COMPACT_FRAMES: usize = 64;
 
 type PendingResultSender = oneshot::Sender<anyhow::Result<()>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactContentionStrategy {
+    Inline,
+    Queue,
+}
 
 struct PendingCompactFrame {
     buffer: Box<[u8]>,
@@ -45,22 +52,24 @@ impl FrameWriter {
             bail!("payload too large: {}", payload_len);
         }
         let header = build_frame_header(cmd, stream_id, payload_len);
-        if cmd == CMD_PSH && payload_len <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
+        if payload_len <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
             if let Ok(mut writer) = self.inner.try_lock() {
                 write_compact_frame(&mut *writer, &header, payload).await?;
                 self.flush_after_write(&mut *writer, cmd, payload_len)
                     .await?;
                 return Ok(());
             }
-            return self.enqueue_compact_frame(&header, cmd, payload).await;
+            if compact_contention_strategy(cmd, payload_len) == CompactContentionStrategy::Queue {
+                return self.enqueue_compact_frame(&header, cmd, payload).await;
+            }
+
+            let mut writer = self.inner.lock().await;
+            write_compact_frame(&mut *writer, &header, payload).await?;
+            return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
 
         let mut writer = self.inner.lock().await;
-        if payload_len <= COMPACT_FRAME_PAYLOAD_THRESHOLD {
-            write_compact_frame(&mut *writer, &header, payload).await?;
-        } else {
-            write_frame_parts(&mut *writer, &header, payload).await?;
-        }
+        write_frame_parts(&mut *writer, &header, payload).await?;
         self.flush_after_write(&mut *writer, cmd, payload_len).await
     }
 
@@ -126,6 +135,16 @@ fn build_frame_header(cmd: u8, stream_id: u32, payload_len: usize) -> [u8; 7] {
     header[1..5].copy_from_slice(&stream_id.to_be_bytes());
     header[5..7].copy_from_slice(&(payload_len as u16).to_be_bytes());
     header
+}
+
+fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContentionStrategy {
+    // Tiny PSH frames already require an immediate flush, so the pending compact queue
+    // adds per-frame allocation/notification cost without much batching benefit.
+    if cmd == CMD_PSH && payload_len > SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+        CompactContentionStrategy::Queue
+    } else {
+        CompactContentionStrategy::Inline
+    }
 }
 
 fn enqueue_pending_compact_frame(
@@ -509,5 +528,37 @@ mod tests {
             .expect("write frame buffers");
         assert_eq!(writer.bytes, b"helloworld!");
         assert!(writer.write_vectored_calls >= 3);
+    }
+
+    #[test]
+    fn small_flush_bound_psh_frames_stay_inline_under_contention() {
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, 1024),
+            CompactContentionStrategy::Inline
+        );
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD),
+            CompactContentionStrategy::Inline
+        );
+    }
+
+    #[test]
+    fn larger_psh_frames_still_use_pending_queue_under_contention() {
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, SMALL_DATA_FRAME_FLUSH_THRESHOLD + 1),
+            CompactContentionStrategy::Queue
+        );
+        assert_eq!(
+            compact_contention_strategy(CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD),
+            CompactContentionStrategy::Queue
+        );
+    }
+
+    #[test]
+    fn control_frames_never_enter_pending_compact_queue() {
+        assert_eq!(
+            compact_contention_strategy(super::super::frame::CMD_FIN, 0),
+            CompactContentionStrategy::Inline
+        );
     }
 }
