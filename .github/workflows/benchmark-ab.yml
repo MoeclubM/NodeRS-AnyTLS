@@ -45,15 +45,16 @@ jobs:
         run: cargo fetch --locked
 
       - name: Run benchmark matrix
-        env:
-          COMPARE_COUNT: ${{ github.event_name == 'workflow_dispatch' && inputs.compare_count || '3' }}
-          SING_BOX_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.sing_box_version || 'latest' }}
         run: |
+          compare_count="${{ github.event.inputs.compare_count }}"
+          sing_box_version="${{ github.event.inputs.sing_box_version }}"
+          compare_count="${compare_count:-3}"
+          sing_box_version="${sing_box_version:-latest}"
           python3 scripts/benchmark_ab_report.py \
             --output-dir target/benchmark-ab \
             --target x86_64-unknown-linux-musl \
-            --compare-count "$COMPARE_COUNT" \
-            --sing-version "$SING_BOX_VERSION"
+            --compare-count "$compare_count" \
+            --sing-version "$sing_box_version"
 
       - name: Publish benchmark summary
         if: always()
