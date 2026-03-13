@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-COMPARE_SOCKS = ROOT / "benchmark" / "compare_socks.py"
+COMPARE_SOCKS = ROOT / "scripts" / "benchmark_compare_socks.py"
 USERS = [f"bench-user-uuid-{index:02d}" for index in range(1, 5)]
 RESULT_RE = re.compile(
     r"mode=(?P<mode>\S+) parallel=(?P<parallel>\d+) chunk=(?P<chunk>\d+) "
