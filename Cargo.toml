@@ -3,6 +3,10 @@ name = "noders-anytls"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+linux-mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 anyhow = "1.0.102"
 base64 = "0.22.1"
@@ -31,5 +35,5 @@ tracing-subscriber = { version = "0.3.22", features = ["fmt", "std"] }
 tokio = { version = "1.50.0", features = ["macros", "rt", "time", "test-util", "io-util"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-mimalloc = { version = "0.1.48", default-features = false }
+mimalloc = { version = "0.1.48", default-features = false, optional = true }
 

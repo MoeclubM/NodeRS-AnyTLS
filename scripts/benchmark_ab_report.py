@@ -37,6 +37,7 @@ class Case:
     parallel: int
     chunk_size: int
     seconds: int
+    netem_profile: str | None = None
 
 
 @dataclass
@@ -47,15 +48,25 @@ class Implementation:
     commit: str
     binary: pathlib.Path
     version: str | None = None
+    bench_binary: pathlib.Path | None = None
 
 
 CASES = [
+    Case("upload-size-1024", "upload", 1, 1024, 4),
+    Case("download-size-1024", "download", 1, 1024, 4),
     Case("upload-size-32768", "upload", 1, 32768, 4),
     Case("download-size-32768", "download", 1, 32768, 4),
+    Case("upload-concurrency-small", "upload", 16, 1024, 6),
+    Case("download-concurrency-small", "download", 16, 1024, 6),
     Case("upload-concurrency-large", "upload", 16, 32768, 6),
     Case("download-concurrency-large", "download", 16, 32768, 6),
-    Case("download-concurrency-small", "download", 16, 1024, 6),
+    Case("upload-concurrency-small-lossy", "upload", 16, 1024, 8, "lossy-small"),
+    Case("download-concurrency-small-lossy", "download", 16, 1024, 8, "lossy-small"),
 ]
+
+NETEM_PROFILES = {
+    "lossy-small": ["delay", "15ms", "3ms", "loss", "0.5%"],
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", default="x86_64-unknown-linux-musl")
     parser.add_argument("--compare-count", type=int, default=3)
     parser.add_argument("--sing-version", default="latest")
+    parser.add_argument("--enable-netem", action="store_true")
     return parser.parse_args()
 
 
@@ -86,6 +98,22 @@ def run_checked(
 
 def git_output(*args: str) -> str:
     return run_checked(["git", *args], capture_output=True).stdout.strip()
+
+
+def run_best_effort(
+    command: list[str],
+    *,
+    cwd: pathlib.Path | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        cwd=str(cwd or ROOT),
+        env=env,
+        text=True,
+        check=False,
+        capture_output=True,
+    )
 
 
 def select_previous_tags(limit: int) -> list[str]:
@@ -179,6 +207,22 @@ def collect_idle_memory(pid: int) -> dict[str, float]:
         sampler.sample()
         time.sleep(0.2)
     return sampler.summary()
+
+
+@contextmanager
+def applied_netem(profile: str | None, enabled: bool):
+    if not enabled or profile is None:
+        yield
+        return
+    arguments = NETEM_PROFILES[profile]
+    run_best_effort(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"])
+    run_checked(["sudo", "tc", "qdisc", "replace", "dev", "lo", "root", "netem", *arguments])
+    time.sleep(0.2)
+    try:
+        yield
+    finally:
+        run_best_effort(["sudo", "tc", "qdisc", "del", "dev", "lo", "root"])
+        time.sleep(0.2)
 
 
 def ensure_tls_materials(work_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
@@ -536,7 +580,9 @@ def benchmark_impl(
     bench_binary: pathlib.Path,
     sing_binary: pathlib.Path,
     output_dir: pathlib.Path,
+    enable_netem: bool = False,
 ) -> tuple[dict[str, float], list[dict[str, object]]]:
+    effective_bench_binary = implementation.bench_binary or bench_binary
     impl_dir = output_dir / implementation.label
     impl_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"benchmark-{implementation.label}-") as temp_dir:
@@ -549,7 +595,7 @@ def benchmark_impl(
         with ExitStack() as stack:
             stack.enter_context(
                 started_process(
-                    [str(bench_binary), "sink", "--listen", f"127.0.0.1:{sink_port}"],
+                    [str(effective_bench_binary), "sink", "--listen", f"127.0.0.1:{sink_port}"],
                     stdout_path=impl_dir / "sink.stdout.log",
                     stderr_path=impl_dir / "sink.stderr.log",
                     ready_port=sink_port,
@@ -602,35 +648,36 @@ def benchmark_impl(
 
             rows: list[dict[str, object]] = []
             for case in CASES:
-                if case.mode == "upload":
-                    metrics = run_compare_socks(
-                        server_pid=server_proc.pid,
-                        proxies=proxies,
-                        target=f"127.0.0.1:{sink_port}",
-                        case=case,
-                        logs_dir=impl_dir,
-                    )
-                else:
-                    with started_process(
-                        [
-                            str(bench_binary),
-                            "source",
-                            "--listen",
-                            f"127.0.0.1:{source_port}",
-                            "--chunk-size",
-                            str(case.chunk_size),
-                        ],
-                        stdout_path=impl_dir / f"{case.name}.source.stdout.log",
-                        stderr_path=impl_dir / f"{case.name}.source.stderr.log",
-                        ready_port=source_port,
-                    ):
+                with applied_netem(case.netem_profile, enable_netem):
+                    if case.mode == "upload":
                         metrics = run_compare_socks(
                             server_pid=server_proc.pid,
                             proxies=proxies,
-                            target=f"127.0.0.1:{source_port}",
+                            target=f"127.0.0.1:{sink_port}",
                             case=case,
                             logs_dir=impl_dir,
                         )
+                    else:
+                        with started_process(
+                            [
+                                str(effective_bench_binary),
+                                "source",
+                                "--listen",
+                                f"127.0.0.1:{source_port}",
+                                "--chunk-size",
+                                str(case.chunk_size),
+                            ],
+                            stdout_path=impl_dir / f"{case.name}.source.stdout.log",
+                            stderr_path=impl_dir / f"{case.name}.source.stderr.log",
+                            ready_port=source_port,
+                        ):
+                            metrics = run_compare_socks(
+                                server_pid=server_proc.pid,
+                                proxies=proxies,
+                                target=f"127.0.0.1:{source_port}",
+                                case=case,
+                                logs_dir=impl_dir,
+                            )
                 rows.append(
                     {
                         "impl": implementation.label,
@@ -649,26 +696,36 @@ def binary_path(target_dir: pathlib.Path, target: str, name: str) -> pathlib.Pat
     return target_dir / target / "release" / name
 
 
-def build_current(output_dir: pathlib.Path, target: str) -> tuple[pathlib.Path, pathlib.Path]:
-    target_dir = output_dir / "build-current"
+def build_current_variant(
+    output_dir: pathlib.Path,
+    target: str,
+    *,
+    label: str,
+    features: list[str] | None = None,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    target_dir = output_dir / "build-current" / label
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
-    run_checked(
-        [
-            "cargo",
-            "build",
-            "--release",
-            "--locked",
-            "--target",
-            target,
-            "--bin",
-            "noders-anytls",
-            "--bin",
-            "bench_anytls",
-        ],
-        env=env,
-    )
+    command = [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "--target",
+        target,
+        "--bin",
+        "noders-anytls",
+        "--bin",
+        "bench_anytls",
+    ]
+    if features:
+        command.extend(["--features", ",".join(features)])
+    run_checked(command, env=env)
     return binary_path(target_dir, target, "noders-anytls"), binary_path(target_dir, target, "bench_anytls")
+
+
+def build_current(output_dir: pathlib.Path, target: str) -> tuple[pathlib.Path, pathlib.Path]:
+    return build_current_variant(output_dir, target, label=f"{target}-default")
 
 
 def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path:
@@ -903,6 +960,7 @@ def main() -> int:
             bench_binary=bench_binary,
             sing_binary=sing_binary,
             output_dir=output_dir / "logs",
+            enable_netem=args.enable_netem,
         )
         idle_rows.append({"impl": implementation.label, **idle_memory})
         result_rows.extend(rows)

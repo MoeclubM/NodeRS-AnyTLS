@@ -19,9 +19,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  benchmark:
+  version-compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +36,7 @@ jobs:
       - name: Install system packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools openssl
+          sudo apt-get install -y iproute2 musl-tools openssl
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -44,7 +44,7 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
-      - name: Run benchmark matrix
+      - name: Run version comparison benchmark
         run: |
           compare_count="${{ github.event.inputs.compare_count }}"
           sing_box_version="${{ github.event.inputs.sing_box_version }}"
@@ -54,21 +54,77 @@ jobs:
             --output-dir target/benchmark-ab \
             --target x86_64-unknown-linux-musl \
             --compare-count "$compare_count" \
-            --sing-version "$sing_box_version"
+            --sing-version "$sing_box_version" \
+            --enable-netem
 
-      - name: Publish benchmark summary
+      - name: Publish version comparison summary
         if: always()
         run: |
+          echo "## Version Compare" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
           if [ -f target/benchmark-ab/report.md ]; then
             cat target/benchmark-ab/report.md >> "$GITHUB_STEP_SUMMARY"
           else
             echo "Benchmark report was not generated." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload benchmark artifact
+      - name: Upload version comparison artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-ab
+          name: benchmark-ab-versions
           path: target/benchmark-ab
+          if-no-files-found: error
+
+  runtime-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 musl-tools openssl
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Run runtime matrix benchmark
+        run: |
+          sing_box_version="${{ github.event.inputs.sing_box_version }}"
+          sing_box_version="${sing_box_version:-latest}"
+          python3 scripts/benchmark_runtime_matrix.py \
+            --output-dir target/runtime-matrix \
+            --sing-version "$sing_box_version" \
+            --enable-netem
+
+      - name: Publish runtime matrix summary
+        if: always()
+        run: |
+          echo "## Runtime Matrix" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ -f target/runtime-matrix/report.md ]; then
+            cat target/runtime-matrix/report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Runtime matrix report was not generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload runtime matrix artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-runtime-matrix
+          path: target/runtime-matrix
           if-no-files-found: error
