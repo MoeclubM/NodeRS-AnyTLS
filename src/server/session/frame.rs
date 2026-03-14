@@ -22,11 +22,6 @@ pub(super) const SMALL_DOWNLOAD_COALESCE_TARGET: usize = 24 * 1024;
 pub(super) const SMALL_DOWNLOAD_COALESCE_WAIT: std::time::Duration =
     std::time::Duration::from_millis(2);
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
-// musl builds already favor the short upload path; trimming the large-tier batch keeps
-// high-concurrency 32 KiB uploads from monopolizing CPU time per write.
-#[cfg(target_env = "musl")]
-pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
-#[cfg(not(target_env = "musl"))]
 pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 192 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_IOVECS: usize = 96;
