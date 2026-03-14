@@ -85,8 +85,15 @@ pub(super) fn upload_batch_policy(first_chunk_len: usize) -> UploadBatchPolicy {
 }
 
 pub(super) fn download_coalesce_target(initial_read: usize) -> Option<usize> {
-    (initial_read <= SMALL_DATA_FRAME_FLUSH_THRESHOLD)
-        .then_some(SMALL_DOWNLOAD_COALESCE_TARGET.min(MAX_FRAME_PAYLOAD_LEN))
+    if initial_read <= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+        return Some(SMALL_DOWNLOAD_COALESCE_TARGET.min(MAX_FRAME_PAYLOAD_LEN));
+    }
+    // Large reads can opportunistically fold another immediately-available chunk into the
+    // same frame without waiting, which reduces per-frame overhead under bulk concurrency.
+    if initial_read >= MEDIUM_PAYLOAD_LEN && initial_read < MAX_FRAME_PAYLOAD_LEN {
+        return Some(MAX_FRAME_PAYLOAD_LEN);
+    }
+    None
 }
 
 pub(super) fn inbound_segment_len(payload_len: usize) -> usize {

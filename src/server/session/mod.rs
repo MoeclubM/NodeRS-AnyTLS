@@ -903,7 +903,10 @@ mod tests {
         assert!(large.max_bytes > medium.max_bytes);
         assert!(download_coalesce_target(1024).is_some());
         assert!(download_coalesce_target(8 * 1024).is_none());
-        assert!(download_coalesce_target(32 * 1024).is_none());
+        assert_eq!(
+            download_coalesce_target(32 * 1024),
+            Some(MAX_FRAME_PAYLOAD_LEN)
+        );
     }
 
     #[test]
@@ -1030,6 +1033,28 @@ mod tests {
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
         assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
+    }
+
+    #[tokio::test]
+    async fn coalesces_immediately_available_large_download_reads_without_waiting() {
+        let mut reader = SegmentedReader::new([vec![1u8; 32 * 1024], vec![2u8; 24 * 1024]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..32 * 1024])
+            .await
+            .expect("read first large chunk");
+        assert_eq!(first, 32 * 1024);
+
+        let target = download_coalesce_target(first).expect("large reads should coalesce");
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, target)
+            .await
+            .expect("coalesce immediate large read");
+
+        assert_eq!(filled, 56 * 1024);
+        assert!(!saw_eof);
+        assert!(buffer[..32 * 1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[32 * 1024..56 * 1024].iter().all(|byte| *byte == 2));
     }
 
     #[tokio::test]
