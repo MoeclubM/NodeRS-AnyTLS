@@ -2,7 +2,6 @@ use anyhow::{Context, ensure};
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io::IoSlice;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
@@ -277,15 +276,13 @@ async fn write_chunk_batch_vectored<W, const N: usize>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut slices: [MaybeUninit<IoSlice<'_>>; N] = [const { MaybeUninit::uninit() }; N];
-    let count = fill_chunk_batch_slices_uninit(chunks, front_offset, &mut slices, policy);
+    let mut slices: [IoSlice<'_>; N] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
     if count == 0 {
         return Ok(0);
     }
-    let slices =
-        unsafe { std::slice::from_raw_parts(slices.as_ptr().cast::<IoSlice<'_>>(), count) };
     writer
-        .write_vectored(slices)
+        .write_vectored(&slices[..count])
         .await
         .context("write inbound chunk batch")
 }
@@ -442,34 +439,6 @@ fn fill_chunk_batch_slices<'a>(
         }
         let used = slice.len().min(remaining);
         slices[count] = IoSlice::new(&slice[..used]);
-        count += 1;
-        remaining -= used;
-    }
-    count
-}
-
-fn fill_chunk_batch_slices_uninit<'a>(
-    chunks: &'a VecDeque<BufferedChunk>,
-    front_offset: usize,
-    slices: &mut [MaybeUninit<IoSlice<'a>>],
-    policy: super::frame::UploadBatchPolicy,
-) -> usize {
-    let mut count = 0usize;
-    let mut remaining = policy.max_bytes;
-    for (index, chunk) in chunks.iter().enumerate() {
-        if count >= slices.len() || count >= policy.max_iovecs || remaining == 0 {
-            break;
-        }
-        let slice = if index == 0 {
-            &chunk.bytes()[front_offset..]
-        } else {
-            chunk.bytes()
-        };
-        if slice.is_empty() {
-            continue;
-        }
-        let used = slice.len().min(remaining);
-        slices[count].write(IoSlice::new(&slice[..used]));
         count += 1;
         remaining -= used;
     }

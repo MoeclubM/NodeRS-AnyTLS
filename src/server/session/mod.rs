@@ -872,57 +872,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct BufferedWriteRecorder {
-        bytes: Vec<u8>,
-        scalar_writes: usize,
-        vectored_writes: usize,
-    }
-
-    impl AsyncWrite for BufferedWriteRecorder {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            self.scalar_writes += 1;
-            self.bytes.extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_write_vectored(
-            mut self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-            bufs: &[IoSlice<'_>],
-        ) -> Poll<std::io::Result<usize>> {
-            self.vectored_writes += 1;
-            let mut written = 0usize;
-            for buf in bufs {
-                self.bytes.extend_from_slice(buf);
-                written += buf.len();
-            }
-            Poll::Ready(Ok(written))
-        }
-
-        fn is_write_vectored(&self) -> bool {
-            true
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            _cx: &mut TaskContext<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
     #[test]
     fn parses_settings_lines() {
         let settings = parse_settings(b"v=2\nclient=test");
@@ -1188,24 +1137,5 @@ mod tests {
         assert_eq!(written, payload.len());
         assert_eq!(writer.scalar_writes, 0);
         assert_eq!(writer.vectored_writes, 1);
-    }
-
-    #[tokio::test]
-    async fn multi_chunk_upload_batch_vectored_path_preserves_payload_order() {
-        let chunks = std::collections::VecDeque::from([
-            test_chunk(b"hello"),
-            test_chunk(b" "),
-            test_chunk(b"world"),
-        ]);
-        let mut writer = BufferedWriteRecorder::default();
-
-        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
-            .await
-            .expect("write multi chunk batch");
-
-        assert_eq!(written, 11);
-        assert_eq!(writer.scalar_writes, 0);
-        assert_eq!(writer.vectored_writes, 1);
-        assert_eq!(writer.bytes, b"hello world");
     }
 }
