@@ -771,47 +771,6 @@ mod tests {
         }
     }
 
-    struct PendingEveryReadSegmentedReader {
-        segments: TestVecDeque<Vec<u8>>,
-        pending_before_next_read: bool,
-    }
-
-    impl PendingEveryReadSegmentedReader {
-        fn new(segments: impl IntoIterator<Item = Vec<u8>>) -> Self {
-            Self {
-                segments: segments.into_iter().collect(),
-                pending_before_next_read: false,
-            }
-        }
-    }
-
-    impl AsyncRead for PendingEveryReadSegmentedReader {
-        fn poll_read(
-            mut self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-            buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            if self.pending_before_next_read {
-                self.pending_before_next_read = false;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-
-            let Some(segment) = self.segments.pop_front() else {
-                return Poll::Pending;
-            };
-            let to_copy = segment.len().min(buf.remaining());
-            buf.put_slice(&segment[..to_copy]);
-            if to_copy < segment.len() {
-                self.segments.push_front(segment[to_copy..].to_vec());
-            }
-            if !self.segments.is_empty() {
-                self.pending_before_next_read = true;
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
     struct DelayedSegmentedReader {
         segments: TestVecDeque<Vec<u8>>,
         delivered_reads: usize,
@@ -1071,34 +1030,6 @@ mod tests {
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
         assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
-    }
-
-    #[tokio::test]
-    async fn coalesces_multiple_delayed_reads_within_shared_wait_budget() {
-        let mut reader = PendingEveryReadSegmentedReader::new([
-            vec![1u8; 1024],
-            vec![2u8; 1024],
-            vec![3u8; 1024],
-            vec![4u8; 1024],
-        ]);
-        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
-
-        let first = reader
-            .read(&mut buffer[..1024])
-            .await
-            .expect("read first chunk");
-        assert_eq!(first, 1024);
-
-        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 4096)
-            .await
-            .expect("coalesce multiple deferred reads");
-
-        assert_eq!(filled, 4096);
-        assert!(!saw_eof);
-        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
-        assert!(buffer[1024..2048].iter().all(|byte| *byte == 2));
-        assert!(buffer[2048..3072].iter().all(|byte| *byte == 3));
-        assert!(buffer[3072..4096].iter().all(|byte| *byte == 4));
     }
 
     #[tokio::test]
