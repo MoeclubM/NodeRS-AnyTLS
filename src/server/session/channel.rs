@@ -139,10 +139,6 @@ impl BufferedChunk {
         self.payload.len()
     }
 
-    pub(super) fn into_payload(self) -> PayloadBuffer {
-        self.payload
-    }
-
     pub(super) fn split_off(self, at: usize) -> Self {
         let bytes = self.payload.into_vec();
         let bytes = bytes[at..].to_vec();
@@ -155,7 +151,7 @@ impl BufferedChunk {
 
 #[derive(Clone)]
 pub(super) struct InboundSender {
-    tx: mpsc::Sender<InboundMessage>,
+    tx: mpsc::UnboundedSender<InboundMessage>,
     budget: Arc<ByteBudget>,
 }
 
@@ -166,7 +162,7 @@ pub(super) enum TrySendError {
 }
 
 impl InboundSender {
-    pub(super) fn new(tx: mpsc::Sender<InboundMessage>, budget_bytes: usize) -> Self {
+    pub(super) fn new(tx: mpsc::UnboundedSender<InboundMessage>, budget_bytes: usize) -> Self {
         Self {
             tx,
             budget: Arc::new(ByteBudget::new(budget_bytes)),
@@ -179,19 +175,9 @@ impl InboundSender {
             Ok(permit) => permit,
             Err(()) => return Err(TrySendError::Full(chunk)),
         };
-        match self
-            .tx
-            .try_send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
-        {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
-                let InboundMessage::Data(chunk) = message else {
-                    return Err(TrySendError::Closed);
-                };
-                Err(TrySendError::Full(chunk.into_payload()))
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed),
-        }
+        self.tx
+            .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
+            .map_err(|_| TrySendError::Closed)
     }
 
     pub(super) async fn send_data(&self, chunk: PayloadBuffer) -> anyhow::Result<()> {
@@ -202,14 +188,12 @@ impl InboundSender {
         };
         self.tx
             .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
-            .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
     }
 
     pub(super) async fn send_fin(&self) -> anyhow::Result<()> {
         self.tx
             .send(InboundMessage::Fin)
-            .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
     }
 }
@@ -257,7 +241,7 @@ impl ByteBudget {
     async fn acquire(
         self: &Arc<Self>,
         len: usize,
-        tx: &mpsc::Sender<InboundMessage>,
+        tx: &mpsc::UnboundedSender<InboundMessage>,
     ) -> Option<ByteBudgetPermit> {
         loop {
             if let Ok(permit) = self.try_acquire(len) {
@@ -302,14 +286,14 @@ impl Drop for ByteBudgetPermit {
 }
 
 pub(super) struct ChannelReader {
-    rx: mpsc::Receiver<InboundMessage>,
+    rx: mpsc::UnboundedReceiver<InboundMessage>,
     current: Option<BufferedChunk>,
     offset: usize,
     finished: bool,
 }
 
 impl ChannelReader {
-    pub(super) fn new(rx: mpsc::Receiver<InboundMessage>) -> Self {
+    pub(super) fn new(rx: mpsc::UnboundedReceiver<InboundMessage>) -> Self {
         Self {
             rx,
             current: None,
@@ -320,7 +304,11 @@ impl ChannelReader {
 
     pub(super) fn into_parts(
         self,
-    ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
+    ) -> (
+        Option<BufferedChunk>,
+        mpsc::UnboundedReceiver<InboundMessage>,
+        bool,
+    ) {
         let pending = self.current.and_then(|current| {
             if self.offset < current.len() {
                 Some(current.split_off(self.offset))
@@ -381,11 +369,12 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-pub(super) fn bounded_inbound_channel(
-    capacity: usize,
+pub(super) fn inbound_channel(
     budget_bytes: usize,
-) -> (InboundSender, mpsc::Receiver<InboundMessage>) {
-    let (tx, rx) = mpsc::channel(capacity);
+) -> (InboundSender, mpsc::UnboundedReceiver<InboundMessage>) {
+    // The byte budget is the real backpressure gate. Keeping the message queue
+    // unbounded avoids paying a second per-send semaphore cost on hot paths.
+    let (tx, rx) = mpsc::unbounded_channel();
     (InboundSender::new(tx, budget_bytes), rx)
 }
 
@@ -403,7 +392,7 @@ mod tests {
 
     #[tokio::test]
     async fn sender_enforces_byte_budget() {
-        let (sender, mut rx) = bounded_inbound_channel(8, 4);
+        let (sender, mut rx) = inbound_channel(4);
         assert!(
             sender
                 .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
@@ -422,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn sender_waits_for_budget_release_before_sending() {
-        let (sender, mut rx) = bounded_inbound_channel(8, 4);
+        let (sender, mut rx) = inbound_channel(4);
         sender
             .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
             .expect("fill budget");

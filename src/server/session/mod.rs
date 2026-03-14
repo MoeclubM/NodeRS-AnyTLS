@@ -32,7 +32,7 @@ use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
     LARGE_INBOUND_SEGMENT_LEN, MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES,
-    STREAM_INBOUND_QUEUE_CAPACITY, inbound_segment_len, is_eof, padding_md5, parse_settings,
+    inbound_segment_len, is_eof, padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
@@ -276,10 +276,7 @@ impl Session {
             return Ok(());
         }
 
-        let (inbound_tx, inbound_rx) = channel::bounded_inbound_channel(
-            STREAM_INBOUND_QUEUE_CAPACITY,
-            STREAM_INBOUND_QUEUE_BYTES,
-        );
+        let (inbound_tx, inbound_rx) = channel::inbound_channel(STREAM_INBOUND_QUEUE_BYTES);
 
         let writer = self.writer.clone();
         let accounting = self.accounting.clone();
@@ -903,12 +900,10 @@ mod tests {
 
     #[tokio::test]
     async fn channel_reader_coalesces_multiple_chunks() {
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::unbounded_channel();
         tx.send(InboundMessage::Data(test_chunk(b"hello")))
-            .await
             .expect("send first chunk");
         tx.send(InboundMessage::Data(test_chunk(b"world")))
-            .await
             .expect("send second chunk");
         drop(tx);
 
