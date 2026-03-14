@@ -401,13 +401,11 @@ remove_service_account() {
 }
 
 remove_single_node() {
-  local node_id config_path cert_path key_path legacy_cert_path legacy_key_path account_key_path self_signed_cert_path self_signed_key_path unit_name log_path pid_path
+  local node_id config_path cert_path key_path account_key_path self_signed_cert_path self_signed_key_path unit_name log_path pid_path
   node_id="$1"
   config_path="$(node_config_path "$node_id")"
   cert_path="$(node_cert_path "$node_id")"
   key_path="$(node_key_path "$node_id")"
-  legacy_cert_path="${CONFIG_DIR%/}/cert-${node_id}.pem"
-  legacy_key_path="${CONFIG_DIR%/}/key-${node_id}.pem"
   account_key_path="$(node_account_key_path "$node_id")"
   self_signed_cert_path="$(node_self_signed_cert_path "$node_id")"
   self_signed_key_path="$(node_self_signed_key_path "$node_id")"
@@ -416,7 +414,7 @@ remove_single_node() {
   pid_path="$(node_service_pid_path "$node_id")"
 
   stop_disable_unit "$unit_name"
-  rm -f "$config_path" "$cert_path" "$key_path" "$legacy_cert_path" "$legacy_key_path" "$account_key_path" "$self_signed_cert_path" "$self_signed_key_path" "$log_path" "$pid_path"
+  rm -f "$config_path" "$cert_path" "$key_path" "$account_key_path" "$self_signed_cert_path" "$self_signed_key_path" "$log_path" "$pid_path"
 }
 
 remove_all_nodes() {
