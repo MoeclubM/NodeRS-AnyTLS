@@ -1043,6 +1043,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coalesces_multiple_immediately_available_threshold_sized_reads() {
+        let mut reader = SegmentedReader::new([vec![1u8; 1024], vec![2u8; 4096], vec![3u8; 4096]]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, 9 * 1024)
+            .await
+            .expect("coalesce repeated threshold-sized reads");
+
+        assert_eq!(filled, 9 * 1024);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[1024..5 * 1024].iter().all(|byte| *byte == 2));
+        assert!(buffer[5 * 1024..9 * 1024].iter().all(|byte| *byte == 3));
+    }
+
+    #[tokio::test]
     async fn coalesces_immediately_available_large_download_reads_without_waiting() {
         let mut reader = SegmentedReader::new([vec![1u8; 32 * 1024], vec![2u8; 24 * 1024]]);
         let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];

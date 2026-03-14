@@ -335,9 +335,6 @@ where
             Some(read) => {
                 filled += read;
                 retried_after_yield = false;
-                if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
-                    break;
-                }
             }
             // Under high concurrency the next download chunk often lands on the next scheduler
             // turn instead of being immediately readable. Yield once before giving up so we can
@@ -365,9 +362,6 @@ where
                     Some(read) => {
                         filled += read;
                         retried_after_yield = false;
-                        if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
-                            break;
-                        }
                     }
                     None => break,
                 }
