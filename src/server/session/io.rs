@@ -22,7 +22,7 @@ use super::writer::{FrameWriter, write_frame};
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
-    mut rx: mpsc::UnboundedReceiver<InboundMessage>,
+    mut rx: mpsc::Receiver<InboundMessage>,
     mut finished: bool,
     writer: &mut W,
     control: Arc<SessionControl>,

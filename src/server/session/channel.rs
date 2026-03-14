@@ -6,6 +6,8 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
+use super::frame::SMALL_DATA_FRAME_FLUSH_THRESHOLD;
+
 pub(super) enum InboundMessage {
     Data(BufferedChunk),
     Fin,
@@ -139,6 +141,10 @@ impl BufferedChunk {
         self.payload.len()
     }
 
+    pub(super) fn into_payload(self) -> PayloadBuffer {
+        self.payload
+    }
+
     pub(super) fn split_off(self, at: usize) -> Self {
         let bytes = self.payload.into_vec();
         let bytes = bytes[at..].to_vec();
@@ -151,8 +157,9 @@ impl BufferedChunk {
 
 #[derive(Clone)]
 pub(super) struct InboundSender {
-    tx: mpsc::UnboundedSender<InboundMessage>,
+    tx: mpsc::Sender<InboundMessage>,
     budget: Arc<ByteBudget>,
+    small_budget_cache: Arc<Mutex<SenderBudgetCache>>,
 }
 
 #[derive(Debug)]
@@ -162,39 +169,137 @@ pub(super) enum TrySendError {
 }
 
 impl InboundSender {
-    pub(super) fn new(tx: mpsc::UnboundedSender<InboundMessage>, budget_bytes: usize) -> Self {
+    pub(super) fn new(tx: mpsc::Sender<InboundMessage>, budget_bytes: usize) -> Self {
+        let budget = Arc::new(ByteBudget::new(budget_bytes));
         Self {
             tx,
-            budget: Arc::new(ByteBudget::new(budget_bytes)),
+            budget: budget.clone(),
+            small_budget_cache: Arc::new(Mutex::new(SenderBudgetCache::new(budget))),
         }
     }
 
     pub(super) fn try_send_data(&self, chunk: PayloadBuffer) -> Result<(), TrySendError> {
-        let len = chunk.len();
-        let permit = match self.budget.try_acquire(len) {
+        let permit = match self.try_reserve_send_budget(chunk.len()) {
             Ok(permit) => permit,
             Err(()) => return Err(TrySendError::Full(chunk)),
         };
-        self.tx
-            .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
-            .map_err(|_| TrySendError::Closed)
+        match self
+            .tx
+            .try_send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
+        {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(message)) => {
+                let InboundMessage::Data(chunk) = message else {
+                    return Err(TrySendError::Closed);
+                };
+                Err(TrySendError::Full(chunk.into_payload()))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed),
+        }
     }
 
     pub(super) async fn send_data(&self, chunk: PayloadBuffer) -> anyhow::Result<()> {
-        let Some(permit) = self.budget.acquire(chunk.len(), &self.tx).await else {
+        let Some(permit) = self.reserve_send_budget(chunk.len()).await else {
             return Err(anyhow::anyhow!(
                 "inbound channel closed before data could be delivered"
             ));
         };
         self.tx
             .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
+            .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
     }
 
     pub(super) async fn send_fin(&self) -> anyhow::Result<()> {
         self.tx
             .send(InboundMessage::Fin)
+            .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before FIN could be delivered"))
+    }
+
+    fn try_reserve_send_budget(&self, len: usize) -> Result<ByteBudgetPermit, ()> {
+        if len == 0 {
+            return Ok(ByteBudgetPermit::new(self.budget.clone(), 0));
+        }
+        if len > SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+            self.budget.try_reserve(len)?;
+            return Ok(ByteBudgetPermit::new(self.budget.clone(), len));
+        }
+
+        let mut cache = self
+            .small_budget_cache
+            .lock()
+            .expect("sender budget cache lock poisoned");
+        if cache.reserved < len {
+            let needed = len - cache.reserved;
+            let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
+            if self.budget.try_reserve(grant).is_ok() {
+                cache.reserved += grant;
+            } else {
+                self.budget.try_reserve(needed)?;
+                cache.reserved += needed;
+            }
+        }
+        cache.reserved -= len;
+        Ok(ByteBudgetPermit::new(self.budget.clone(), len))
+    }
+
+    async fn reserve_send_budget(&self, len: usize) -> Option<ByteBudgetPermit> {
+        if len == 0 {
+            return Some(ByteBudgetPermit::new(self.budget.clone(), 0));
+        }
+        if len > SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+            self.budget.acquire(len, &self.tx).await?;
+            return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+        }
+
+        loop {
+            {
+                let mut cache = self
+                    .small_budget_cache
+                    .lock()
+                    .expect("sender budget cache lock poisoned");
+                if cache.reserved >= len {
+                    cache.reserved -= len;
+                    return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+                }
+            }
+
+            let needed = {
+                let cache = self
+                    .small_budget_cache
+                    .lock()
+                    .expect("sender budget cache lock poisoned");
+                len - cache.reserved
+            };
+            let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
+            if self.budget.try_reserve(grant).is_ok() {
+                let mut cache = self
+                    .small_budget_cache
+                    .lock()
+                    .expect("sender budget cache lock poisoned");
+                cache.reserved += grant;
+                cache.reserved -= len;
+                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+            }
+            if grant != needed && self.budget.try_reserve(needed).is_ok() {
+                let mut cache = self
+                    .small_budget_cache
+                    .lock()
+                    .expect("sender budget cache lock poisoned");
+                cache.reserved += needed;
+                cache.reserved -= len;
+                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+            }
+            self.budget.acquire(needed, &self.tx).await?;
+            let mut cache = self
+                .small_budget_cache
+                .lock()
+                .expect("sender budget cache lock poisoned");
+            cache.reserved += needed;
+            cache.reserved -= len;
+            return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+        }
     }
 }
 
@@ -216,7 +321,10 @@ impl ByteBudget {
         }
     }
 
-    fn try_acquire(self: &Arc<Self>, len: usize) -> Result<ByteBudgetPermit, ()> {
+    fn try_reserve(&self, len: usize) -> Result<(), ()> {
+        if len == 0 {
+            return Ok(());
+        }
         loop {
             let used = self.used.load(Ordering::Acquire);
             let Some(next) = used.checked_add(len) else {
@@ -230,22 +338,18 @@ impl ByteBudget {
                 .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Ok(ByteBudgetPermit {
-                    budget: self.clone(),
-                    len,
-                });
+                return Ok(());
             }
         }
     }
 
-    async fn acquire(
-        self: &Arc<Self>,
-        len: usize,
-        tx: &mpsc::UnboundedSender<InboundMessage>,
-    ) -> Option<ByteBudgetPermit> {
+    async fn acquire(&self, len: usize, tx: &mpsc::Sender<InboundMessage>) -> Option<()> {
+        if len == 0 {
+            return Some(());
+        }
         loop {
-            if let Ok(permit) = self.try_acquire(len) {
-                return Some(permit);
+            if self.try_reserve(len).is_ok() {
+                return Some(());
             }
             if tx.is_closed() {
                 return None;
@@ -253,8 +357,8 @@ impl ByteBudget {
             let notified = self.notify.notified();
             // Re-check after registering interest so a concurrent release cannot
             // race past us and leave the sender sleeping indefinitely.
-            if let Ok(permit) = self.try_acquire(len) {
-                return Some(permit);
+            if self.try_reserve(len).is_ok() {
+                return Some(());
             }
             if tx.is_closed() {
                 return None;
@@ -274,9 +378,36 @@ impl ByteBudget {
 }
 
 #[derive(Debug)]
+struct SenderBudgetCache {
+    budget: Arc<ByteBudget>,
+    reserved: usize,
+}
+
+impl SenderBudgetCache {
+    fn new(budget: Arc<ByteBudget>) -> Self {
+        Self {
+            budget,
+            reserved: 0,
+        }
+    }
+}
+
+impl Drop for SenderBudgetCache {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved);
+    }
+}
+
+#[derive(Debug)]
 struct ByteBudgetPermit {
     budget: Arc<ByteBudget>,
     len: usize,
+}
+
+impl ByteBudgetPermit {
+    fn new(budget: Arc<ByteBudget>, len: usize) -> Self {
+        Self { budget, len }
+    }
 }
 
 impl Drop for ByteBudgetPermit {
@@ -286,14 +417,14 @@ impl Drop for ByteBudgetPermit {
 }
 
 pub(super) struct ChannelReader {
-    rx: mpsc::UnboundedReceiver<InboundMessage>,
+    rx: mpsc::Receiver<InboundMessage>,
     current: Option<BufferedChunk>,
     offset: usize,
     finished: bool,
 }
 
 impl ChannelReader {
-    pub(super) fn new(rx: mpsc::UnboundedReceiver<InboundMessage>) -> Self {
+    pub(super) fn new(rx: mpsc::Receiver<InboundMessage>) -> Self {
         Self {
             rx,
             current: None,
@@ -304,11 +435,7 @@ impl ChannelReader {
 
     pub(super) fn into_parts(
         self,
-    ) -> (
-        Option<BufferedChunk>,
-        mpsc::UnboundedReceiver<InboundMessage>,
-        bool,
-    ) {
+    ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
         let pending = self.current.and_then(|current| {
             if self.offset < current.len() {
                 Some(current.split_off(self.offset))
@@ -369,20 +496,21 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-pub(super) fn inbound_channel(
+pub(super) fn bounded_inbound_channel(
+    capacity: usize,
     budget_bytes: usize,
-) -> (InboundSender, mpsc::UnboundedReceiver<InboundMessage>) {
-    // The byte budget is the real backpressure gate. Keeping the message queue
-    // unbounded avoids paying a second per-send semaphore cost on hot paths.
-    let (tx, rx) = mpsc::unbounded_channel();
+) -> (InboundSender, mpsc::Receiver<InboundMessage>) {
+    let (tx, rx) = mpsc::channel(capacity);
     (InboundSender::new(tx, budget_bytes), rx)
 }
 
 #[cfg(test)]
 pub(super) fn test_chunk(bytes: &[u8]) -> BufferedChunk {
-    let permit = Arc::new(ByteBudget::new(bytes.len().max(1)))
-        .try_acquire(bytes.len().max(1))
+    let budget = Arc::new(ByteBudget::new(bytes.len().max(1)));
+    budget
+        .try_reserve(bytes.len().max(1))
         .expect("allocate test permit");
+    let permit = ByteBudgetPermit::new(budget, bytes.len().max(1));
     BufferedChunk::new(PayloadBuffer::new(bytes.to_vec()), permit)
 }
 
@@ -392,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn sender_enforces_byte_budget() {
-        let (sender, mut rx) = inbound_channel(4);
+        let (sender, mut rx) = bounded_inbound_channel(8, 4);
         assert!(
             sender
                 .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
@@ -411,7 +539,7 @@ mod tests {
 
     #[tokio::test]
     async fn sender_waits_for_budget_release_before_sending() {
-        let (sender, mut rx) = inbound_channel(4);
+        let (sender, mut rx) = bounded_inbound_channel(8, 4);
         sender
             .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
             .expect("fill budget");
@@ -435,6 +563,48 @@ mod tests {
             panic!("expected second data chunk");
         };
         assert_eq!(chunk.bytes(), &[5]);
+    }
+
+    #[test]
+    fn sender_reuses_reserved_budget_across_small_chunks() {
+        let (sender, _rx) = bounded_inbound_channel(8, SMALL_DATA_FRAME_FLUSH_THRESHOLD);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 1024]))
+            .expect("send first small chunk");
+        assert_eq!(
+            sender.budget.used.load(Ordering::Acquire),
+            SMALL_DATA_FRAME_FLUSH_THRESHOLD
+        );
+
+        sender
+            .try_send_data(PayloadBuffer::new(vec![2; 1024]))
+            .expect("reuse reserved budget");
+        assert_eq!(
+            sender.budget.used.load(Ordering::Acquire),
+            SMALL_DATA_FRAME_FLUSH_THRESHOLD
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_sender_releases_unused_reserved_budget() {
+        let (sender, mut rx) = bounded_inbound_channel(8, SMALL_DATA_FRAME_FLUSH_THRESHOLD);
+        let budget = sender.budget.clone();
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 1024]))
+            .expect("send first small chunk");
+        assert_eq!(
+            budget.used.load(Ordering::Acquire),
+            SMALL_DATA_FRAME_FLUSH_THRESHOLD
+        );
+
+        drop(sender);
+        assert_eq!(budget.used.load(Ordering::Acquire), 1024);
+
+        let Some(InboundMessage::Data(chunk)) = rx.recv().await else {
+            panic!("expected queued chunk");
+        };
+        drop(chunk);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
 
     #[test]
