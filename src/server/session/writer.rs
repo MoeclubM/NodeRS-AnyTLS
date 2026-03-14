@@ -218,9 +218,6 @@ async fn write_compact_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    if writer.is_write_vectored() {
-        return write_frame_parts(writer, header, payload).await;
-    }
     let mut buffer = [0u8; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
     buffer[..7].copy_from_slice(header);
     buffer[7..7 + payload.len()].copy_from_slice(payload);
@@ -386,7 +383,6 @@ mod tests {
     struct MockWriter {
         bytes: Vec<u8>,
         flushes: usize,
-        write_calls: usize,
         write_vectored_calls: usize,
         vectored: bool,
         max_write: usize,
@@ -398,7 +394,6 @@ mod tests {
             _cx: &mut TaskContext<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            self.write_calls += 1;
             let limit = if self.max_write == 0 {
                 buf.len()
             } else {
@@ -533,22 +528,6 @@ mod tests {
             .expect("write frame buffers");
         assert_eq!(writer.bytes, b"helloworld!");
         assert!(writer.write_vectored_calls >= 3);
-    }
-
-    #[tokio::test]
-    async fn compact_frames_use_vectored_writes_when_available() {
-        let mut writer = MockWriter {
-            vectored: true,
-            ..Default::default()
-        };
-
-        write_compact_frame(&mut writer, &build_frame_header(CMD_PSH, 7, 5), b"hello")
-            .await
-            .expect("write compact frame");
-
-        assert_eq!(writer.bytes.len(), 12);
-        assert_eq!(writer.write_calls, 0);
-        assert_eq!(writer.write_vectored_calls, 1);
     }
 
     #[test]
