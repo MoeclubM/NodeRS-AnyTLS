@@ -211,6 +211,15 @@ where
     let Some(front) = chunks.front() else {
         return Ok(0);
     };
+    // On musl, the single-slice vectored path has repeatedly benchmarked worse than a plain
+    // scalar write for upload-heavy workloads. Keep GNU on the existing mixed strategy.
+    #[cfg(target_env = "musl")]
+    if chunks.len() == 1 {
+        return writer
+            .write(&front.bytes()[front_offset..])
+            .await
+            .context("write inbound chunk");
+    }
     if chunks.len() == 1 && front.len().saturating_sub(front_offset) <= SMALL_PAYLOAD_LEN {
         return writer
             .write(&front.bytes()[front_offset..])
