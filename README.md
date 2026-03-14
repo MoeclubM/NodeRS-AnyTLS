@@ -178,6 +178,16 @@ curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts
 curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/upgrade.sh | bash -s -- --version v0.0.9 --no-restart
 ```
 
+### Cleanup migrate older installs to v0.0.26
+
+If the host was installed from an older layout and you want one pass that upgrades the binary, renames old `cert-<node_id>.pem` / `key-<node_id>.pem` files, rewrites matching config paths, and removes obsolete `tls.server_name` lines, use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MoeclubM/NodeRS-AnyTLS/main/scripts/migrate-upgrade.sh | bash -s -- --version v0.0.26
+```
+
+Add `--no-restart` if you want to inspect the migrated files before restarting services.
+
 ## Uninstall
 
 ### Remove one node
