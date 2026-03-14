@@ -123,6 +123,7 @@ impl Drop for PayloadBuffer {
     }
 }
 
+#[derive(Debug)]
 pub(super) struct BufferedChunk {
     payload: PayloadBuffer,
     permit: ByteBudgetPermit,
@@ -139,10 +140,6 @@ impl BufferedChunk {
 
     pub(super) fn len(&self) -> usize {
         self.payload.len()
-    }
-
-    pub(super) fn into_payload(self) -> PayloadBuffer {
-        self.payload
     }
 
     pub(super) fn split_off(self, at: usize) -> Self {
@@ -165,6 +162,7 @@ pub(super) struct InboundSender {
 #[derive(Debug)]
 pub(super) enum TrySendError {
     Full(PayloadBuffer),
+    FullReserved(BufferedChunk),
     Closed,
 }
 
@@ -192,7 +190,7 @@ impl InboundSender {
                 let InboundMessage::Data(chunk) = message else {
                     return Err(TrySendError::Closed);
                 };
-                Err(TrySendError::Full(chunk.into_payload()))
+                Err(TrySendError::FullReserved(chunk))
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(TrySendError::Closed),
         }
@@ -206,6 +204,13 @@ impl InboundSender {
         };
         self.tx
             .send(InboundMessage::Data(BufferedChunk::new(chunk, permit)))
+            .await
+            .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
+    }
+
+    pub(super) async fn send_reserved_data(&self, chunk: BufferedChunk) -> anyhow::Result<()> {
+        self.tx
+            .send(InboundMessage::Data(chunk))
             .await
             .map_err(|_| anyhow::anyhow!("inbound channel closed before data could be delivered"))
     }
@@ -568,6 +573,41 @@ mod tests {
             panic!("expected second data chunk");
         };
         assert_eq!(chunk.bytes(), &[5]);
+    }
+
+    #[tokio::test]
+    async fn sender_reuses_reserved_budget_when_queue_is_full() {
+        let (sender, mut rx) = bounded_inbound_channel(1, SMALL_DATA_FRAME_FLUSH_THRESHOLD);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 1024]))
+            .expect("queue first small chunk");
+
+        let queued = match sender.try_send_data(PayloadBuffer::new(vec![2; 1024])) {
+            Err(TrySendError::FullReserved(chunk)) => chunk,
+            other => panic!("expected reserved full chunk, got {other:?}"),
+        };
+        assert_eq!(
+            sender.budget.used.load(Ordering::Acquire),
+            SMALL_DATA_FRAME_FLUSH_THRESHOLD
+        );
+
+        let sender_clone = sender.clone();
+        let send_task = tokio::spawn(async move { sender_clone.send_reserved_data(queued).await });
+
+        tokio::task::yield_now().await;
+        assert!(!send_task.is_finished());
+
+        let Some(InboundMessage::Data(chunk)) = rx.recv().await else {
+            panic!("expected first queued chunk");
+        };
+        drop(chunk);
+
+        assert!(send_task.await.expect("join reserved sender").is_ok());
+
+        let Some(InboundMessage::Data(chunk)) = rx.recv().await else {
+            panic!("expected second queued chunk");
+        };
+        assert_eq!(chunk.bytes(), &[2; 1024]);
     }
 
     #[test]

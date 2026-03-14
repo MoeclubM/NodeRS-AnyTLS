@@ -442,6 +442,13 @@ impl Session {
     ) -> anyhow::Result<()> {
         match inbound.try_send_data(payload) {
             Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+            Err(channel::TrySendError::FullReserved(chunk)) => {
+                let control = self.lease.control();
+                tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_reserved_data(chunk) => result,
+                }
+            }
             Err(channel::TrySendError::Full(payload)) => {
                 let control = self.lease.control();
                 tokio::select! {
