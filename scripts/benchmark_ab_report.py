@@ -72,7 +72,7 @@ NETEM_PROFILES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current NodeRS, previous tags, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--target", default="x86_64-unknown-linux-musl")
+    parser.add_argument("--target", default="x86_64-unknown-linux-gnu")
     parser.add_argument("--compare-count", type=int, default=3)
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
@@ -701,7 +701,6 @@ def build_current_variant(
     target: str,
     *,
     label: str,
-    features: list[str] | None = None,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     target_dir = output_dir / "build-current" / label
     env = os.environ.copy()
@@ -718,8 +717,6 @@ def build_current_variant(
         "--bin",
         "bench_anytls",
     ]
-    if features:
-        command.extend(["--features", ",".join(features)])
     run_checked(command, env=env)
     return binary_path(target_dir, target, "noders-anytls"), binary_path(target_dir, target, "bench_anytls")
 

@@ -67,8 +67,70 @@ detect_asset_suffix() {
     return
   fi
 
+  local detected_glibc_version libc_family
+  version_at_least() {
+    local lhs rhs
+    lhs="$1"
+    rhs="$2"
+    awk -v lhs="$lhs" -v rhs="$rhs" '
+      BEGIN {
+        split(lhs, left, ".");
+        split(rhs, right, ".");
+        max_len = length(left) > length(right) ? length(left) : length(right);
+        for (i = 1; i <= max_len; i++) {
+          left_part = (i in left) ? left[i] + 0 : 0;
+          right_part = (i in right) ? right[i] + 0 : 0;
+          if (left_part > right_part) exit 0;
+          if (left_part < right_part) exit 1;
+        }
+        exit 0;
+      }
+    '
+  }
+  glibc_version() {
+    if command -v getconf >/dev/null 2>&1; then
+      getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}'
+    fi
+  }
+  detect_local_libc() {
+    local output version
+    version="$(glibc_version)"
+    if [[ -n "$version" ]]; then
+      printf 'glibc\n'
+      return
+    fi
+    if command -v ldd >/dev/null 2>&1; then
+      output="$(ldd --version 2>&1 || true)"
+      if printf '%s' "$output" | grep -qi 'musl'; then
+        printf 'musl\n'
+        return
+      fi
+    fi
+    if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null; then
+      printf 'musl\n'
+      return
+    fi
+    printf 'unknown\n'
+  }
+
   case "$(uname -m)" in
     x86_64|amd64)
+      libc_family="$(detect_local_libc)"
+      if [[ "$libc_family" == "glibc" ]]; then
+        detected_glibc_version="$(glibc_version)"
+        if [[ -n "$detected_glibc_version" ]] && version_at_least "$detected_glibc_version" "2.17"; then
+          printf 'linux-amd64\n'
+          return
+        fi
+        echo "Detected glibc ${detected_glibc_version:-unknown}; falling back to linux-amd64-musl because GNU builds target glibc >= 2.17." >&2
+        printf 'linux-amd64-musl\n'
+        return
+      fi
+      if [[ "$libc_family" == "musl" ]]; then
+        echo "Detected musl userspace; using linux-amd64-musl release bundle." >&2
+      else
+        echo "Unable to detect the host libc; using linux-amd64-musl release bundle for compatibility." >&2
+      fi
       printf 'linux-amd64-musl\n'
       ;;
     *)

@@ -18,15 +18,13 @@ from benchmark_ab_report import (
 
 
 VARIANTS = [
-    ("gnu-system", "x86_64-unknown-linux-gnu", []),
-    ("gnu-mimalloc", "x86_64-unknown-linux-gnu", ["linux-mimalloc"]),
-    ("musl-system", "x86_64-unknown-linux-musl", []),
-    ("musl-mimalloc", "x86_64-unknown-linux-musl", ["linux-mimalloc"]),
+    ("gnu-system", "x86_64-unknown-linux-gnu"),
+    ("musl-system", "x86_64-unknown-linux-musl"),
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark current runtime variants on Linux.")
+    parser = argparse.ArgumentParser(description="Benchmark current supported runtime variants on Linux.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
@@ -40,6 +38,13 @@ def rows_by_scenario(result_rows: list[dict[str, object]]) -> dict[str, dict[str
     return rows
 
 
+def throughput_delta(summary_rows: list[dict[str, object]], scenario: str) -> str:
+    row = next((item for item in summary_rows if item["scenario"] == scenario), None)
+    if row is None:
+        return "n/a"
+    return str(row["musl_system_vs_gnu_system"])
+
+
 def write_outputs(
     *,
     output_dir: pathlib.Path,
@@ -50,7 +55,7 @@ def write_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_json = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "variants": [label for label, _, _ in VARIANTS],
+        "variants": [label for label, _ in VARIANTS],
         "sing_box_version": sing_version,
         "cases": [case.__dict__ for case in CASES],
         "idle_memory": idle_rows,
@@ -59,20 +64,18 @@ def write_outputs(
     (output_dir / "runtime-matrix-report.json").write_text(json.dumps(raw_json, indent=2), encoding="utf-8")
 
     scenario_rows = rows_by_scenario(result_rows)
-    impl_order = [label for label, _, _ in VARIANTS] + ["SingBox"]
+    impl_order = [label for label, _ in VARIANTS] + ["SingBox"]
     lines = [
         "# Runtime Matrix Report",
         "",
         "- Baseline: `gnu-system`",
-        "- Variants: `gnu-mimalloc`, `musl-system`, `musl-mimalloc`",
+        "- Variants: `musl-system`",
         f"- Sing-box: `{sing_version}`",
         "",
         "## Throughput",
         "",
-        "| Scenario | "
-        + " | ".join(impl_order)
-        + " | gnu-mimalloc vs gnu-system | musl-system vs gnu-system | musl-mimalloc vs musl-system | musl-mimalloc vs gnu-system |",
-        "| --- | " + " | ".join(["---"] * len(impl_order)) + " | --- | --- | --- | --- |",
+        "| Scenario | " + " | ".join(impl_order) + " | musl-system vs gnu-system |",
+        "| --- | " + " | ".join(["---"] * len(impl_order)) + " | --- |",
     ]
     summary_rows: list[dict[str, object]] = []
     for case in CASES:
@@ -84,23 +87,15 @@ def write_outputs(
         ]
         lines.append(
             f"| `{case.name}` | {' | '.join(cells)} | "
-            f"{safe_delta(values['gnu-mimalloc'], values['gnu-system'])} | "
-            f"{safe_delta(values['musl-system'], values['gnu-system'])} | "
-            f"{safe_delta(values['musl-mimalloc'], values['musl-system'])} | "
-            f"{safe_delta(values['musl-mimalloc'], values['gnu-system'])} |"
+            f"{safe_delta(values['musl-system'], values['gnu-system'])} |"
         )
         summary_rows.append(
             {
                 "scenario": case.name,
                 "gnu_system_mbps": values["gnu-system"],
-                "gnu_mimalloc_mbps": values["gnu-mimalloc"],
                 "musl_system_mbps": values["musl-system"],
-                "musl_mimalloc_mbps": values["musl-mimalloc"],
                 "sing_box_mbps": values["SingBox"],
-                "gnu_mimalloc_vs_gnu_system": safe_delta(values["gnu-mimalloc"], values["gnu-system"]),
                 "musl_system_vs_gnu_system": safe_delta(values["musl-system"], values["gnu-system"]),
-                "musl_mimalloc_vs_musl_system": safe_delta(values["musl-mimalloc"], values["musl-system"]),
-                "musl_mimalloc_vs_gnu_system": safe_delta(values["musl-mimalloc"], values["gnu-system"]),
             }
         )
 
@@ -137,76 +132,17 @@ def write_outputs(
             }
         )
 
-    small_case = next((item for item in summary_rows if item["scenario"] == "download-concurrency-small"), None)
     gnu_system_private = idle_by_impl.get("gnu-system", {}).get("avg_private_mb")
-    gnu_mimalloc_private = idle_by_impl.get("gnu-mimalloc", {}).get("avg_private_mb")
     musl_system_private = idle_by_impl.get("musl-system", {}).get("avg_private_mb")
-    musl_mimalloc_private = idle_by_impl.get("musl-mimalloc", {}).get("avg_private_mb")
-
-    def signed_delta(current: float | None, baseline: float | None) -> float | None:
-        if current is None or baseline in (None, 0):
-            return None
-        return ((current - baseline) / baseline) * 100
-
-    small_gnu_mimalloc = signed_delta(
-        small_case["gnu_mimalloc_mbps"] if small_case else None,
-        small_case["gnu_system_mbps"] if small_case else None,
-    )
-    small_musl_system = signed_delta(
-        small_case["musl_system_mbps"] if small_case else None,
-        small_case["gnu_system_mbps"] if small_case else None,
-    )
-    memory_gnu_mimalloc = signed_delta(gnu_mimalloc_private, gnu_system_private)
-    memory_musl_system = signed_delta(musl_system_private, gnu_system_private)
-    memory_musl_mimalloc = signed_delta(musl_mimalloc_private, gnu_system_private)
-
-    memory_mimalloc_regression = max(
-        memory_gnu_mimalloc or 0.0,
-        signed_delta(musl_mimalloc_private, musl_system_private) or 0.0,
-    )
-    memory_musl_regression = max(memory_musl_system or 0.0, 0.0)
-    if memory_gnu_mimalloc is not None and memory_musl_system is not None:
-        if memory_mimalloc_regression > memory_musl_regression * 1.5:
-            memory_culprit = "mimalloc"
-        elif memory_musl_regression > memory_mimalloc_regression * 1.5:
-            memory_culprit = "musl"
-        else:
-            memory_culprit = "mixed"
-    else:
-        memory_culprit = "n/a"
-
-    small_mimalloc_regression = max(
-        -(small_gnu_mimalloc or 0.0),
-        -(signed_delta(
-            small_case["musl_mimalloc_mbps"] if small_case else None,
-            small_case["musl_system_mbps"] if small_case else None,
-        ) or 0.0),
-        0.0,
-    )
-    small_musl_regression = max(-(small_musl_system or 0.0), 0.0)
-    if small_gnu_mimalloc is not None and small_musl_system is not None:
-        if small_mimalloc_regression > small_musl_regression * 1.5:
-            small_packet_culprit = "mimalloc"
-        elif small_musl_regression > small_mimalloc_regression * 1.5:
-            small_packet_culprit = "musl"
-        else:
-            small_packet_culprit = "mixed"
-    else:
-        small_packet_culprit = "n/a"
-
     lines.extend(
         [
             "",
             "## Signals",
             "",
-            f"- Likely idle-memory culprit: `{memory_culprit}`",
-            f"- `gnu-mimalloc` avg private vs `gnu-system`: {safe_delta(gnu_mimalloc_private, gnu_system_private)}",
-            f"- `musl-system` avg private vs `gnu-system`: {safe_delta(musl_system_private, gnu_system_private)}",
-            f"- `musl-mimalloc` avg private vs `gnu-system`: {safe_delta(musl_mimalloc_private, gnu_system_private)}",
-            f"- Likely small-packet culprit on `download-concurrency-small`: `{small_packet_culprit}`",
-            f"- `gnu-mimalloc` vs `gnu-system`: {small_case['gnu_mimalloc_vs_gnu_system'] if small_case else 'n/a'}",
-            f"- `musl-system` vs `gnu-system`: {small_case['musl_system_vs_gnu_system'] if small_case else 'n/a'}",
-            f"- `musl-mimalloc` vs `gnu-system`: {small_case['musl_mimalloc_vs_gnu_system'] if small_case else 'n/a'}",
+            f"- `idle private` musl vs gnu: {safe_delta(musl_system_private, gnu_system_private)}",
+            f"- `download-concurrency-small` musl vs gnu: {throughput_delta(summary_rows, 'download-concurrency-small')}",
+            f"- `download-concurrency-large` musl vs gnu: {throughput_delta(summary_rows, 'download-concurrency-large')}",
+            f"- `download-concurrency-small-lossy` musl vs gnu: {throughput_delta(summary_rows, 'download-concurrency-small-lossy')}",
         ]
     )
 
@@ -224,12 +160,11 @@ def main() -> int:
 
     current_commit = git_output("rev-parse", "HEAD")
     implementations: list[Implementation] = []
-    for label, target, features in VARIANTS:
+    for label, target in VARIANTS:
         node_binary, bench_binary = build_current_variant(
             output_dir,
             target,
             label=label,
-            features=features,
         )
         implementations.append(
             Implementation(

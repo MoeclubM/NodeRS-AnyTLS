@@ -652,7 +652,7 @@ fn jwk_thumbprint(key: &SigningKey) -> anyhow::Result<String> {
         base64url(x),
         base64url(y),
     );
-    Ok(base64url(Sha256::digest(jwk.as_bytes()).as_slice()))
+    Ok(base64url(Sha256::digest(jwk.as_bytes())))
 }
 
 fn sign_base64url(key: &SigningKey, message: &[u8]) -> anyhow::Result<String> {

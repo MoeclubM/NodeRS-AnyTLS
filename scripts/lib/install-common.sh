@@ -14,13 +14,96 @@ require_linux() {
   fi
 }
 
+GNU_GLIBC_FLOOR="2.17"
+
+version_at_least() {
+  local lhs rhs
+  lhs="$1"
+  rhs="$2"
+  awk -v lhs="$lhs" -v rhs="$rhs" '
+    BEGIN {
+      split(lhs, left, ".");
+      split(rhs, right, ".");
+      max_len = length(left) > length(right) ? length(left) : length(right);
+      for (i = 1; i <= max_len; i++) {
+        left_part = (i in left) ? left[i] + 0 : 0;
+        right_part = (i in right) ? right[i] + 0 : 0;
+        if (left_part > right_part) {
+          exit 0;
+        }
+        if (left_part < right_part) {
+          exit 1;
+        }
+      }
+      exit 0;
+    }
+  '
+}
+
+detect_glibc_version() {
+  if command -v getconf >/dev/null 2>&1; then
+    getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}'
+  fi
+}
+
+detect_linux_libc() {
+  local glibc_version ldd_output
+  glibc_version="$(detect_glibc_version)"
+  if [[ -n "$glibc_version" ]]; then
+    printf 'glibc\n'
+    return
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    ldd_output="$(ldd --version 2>&1 || true)"
+    if printf '%s' "$ldd_output" | grep -qi 'musl'; then
+      printf 'musl\n'
+      return
+    fi
+    if printf '%s' "$ldd_output" | grep -qiE 'glibc|gnu libc'; then
+      printf 'glibc\n'
+      return
+    fi
+  fi
+
+  if compgen -G '/lib/ld-musl-*.so.1' >/dev/null || compgen -G '/usr/lib/ld-musl-*.so.1' >/dev/null; then
+    printf 'musl\n'
+    return
+  fi
+
+  printf 'unknown\n'
+}
+
 detect_release_asset_suffix() {
-  case "$(uname -m)" in
+  local arch libc_family glibc_version
+  arch="$(uname -m)"
+  case "$arch" in
     x86_64|amd64)
+      libc_family="$(detect_linux_libc)"
+      if [[ "$libc_family" == "glibc" ]]; then
+        glibc_version="$(detect_glibc_version)"
+        if [[ -n "$glibc_version" ]] && version_at_least "$glibc_version" "$GNU_GLIBC_FLOOR"; then
+          printf 'linux-amd64\n'
+          return
+        fi
+        if [[ -n "$glibc_version" ]]; then
+          echo "Detected glibc ${glibc_version}; falling back to linux-amd64-musl because GNU builds target glibc >= ${GNU_GLIBC_FLOOR}." >&2
+        else
+          echo "Detected glibc but could not determine the exact version; falling back to linux-amd64-musl for compatibility." >&2
+        fi
+        printf 'linux-amd64-musl\n'
+        return
+      fi
+
+      if [[ "$libc_family" == "musl" ]]; then
+        echo "Detected musl userspace; using linux-amd64-musl release bundle." >&2
+      else
+        echo "Unable to detect the host libc; using linux-amd64-musl release bundle for compatibility." >&2
+      fi
       printf 'linux-amd64-musl\n'
       ;;
     *)
-      echo "Unsupported architecture for prebuilt releases: $(uname -m)" >&2
+      echo "Unsupported architecture for prebuilt releases: $arch" >&2
       exit 1
       ;;
   esac

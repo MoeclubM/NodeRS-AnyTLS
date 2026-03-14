@@ -13,33 +13,77 @@ env:
   BIN_NAME: noders-anytls
 
 jobs:
-  build:
-    name: Build Linux release bundle (${{ matrix.asset_suffix }})
+  build-gnu:
+    name: Build GNU release bundle (linux-amd64)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            asset_suffix: linux-amd64
-            apt_packages: ""
-          - target: x86_64-unknown-linux-musl
-            asset_suffix: linux-amd64-musl
-            apt_packages: musl-tools
+    container:
+      image: quay.io/pypa/manylinux2014_x86_64:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install target toolchain
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v curl >/dev/null 2>&1; then
+            yum install -y curl
+          fi
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch dependencies
+        shell: bash
+        run: cargo fetch --locked
+
+      - name: Enforce pure Rust protocol implementation
+        shell: bash
+        run: bash scripts/verify-pure-rust.sh
+
+      - name: Run tests
+        shell: bash
+        run: cargo test --locked --offline
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Prepare release package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
+        run: |
+          set -euo pipefail
+          bash scripts/package-release-bundle.sh \
+            --release-tag "${RELEASE_TAG:-dev}" \
+            --target x86_64-unknown-linux-gnu \
+            --asset-suffix linux-amd64
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-bundle-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+
+  build-musl:
+    name: Build musl release bundle (linux-amd64-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with musl target
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-musl
 
-      - name: Install system packages
-        if: matrix.apt_packages != ''
+      - name: Install musl tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
+          sudo apt-get install -y musl-tools
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -54,40 +98,29 @@ jobs:
         run: cargo test --locked --offline
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
 
       - name: Prepare release package
         shell: bash
         env:
           RELEASE_TAG: ${{ github.event_name != 'workflow_dispatch' && github.ref_name || 'dev' }}
-          TARGET: ${{ matrix.target }}
-          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
         run: |
           set -euo pipefail
-          tag="${RELEASE_TAG:-dev}"
-          package_dir="dist/${BIN_NAME}-${tag}-${ASSET_SUFFIX}"
-          mkdir -p "$package_dir/packaging/systemd" "$package_dir/lib"
-          cp "target/${TARGET}/release/${BIN_NAME}" "$package_dir/${BIN_NAME}"
-          cp README.md LICENSE config.example.toml "$package_dir/"
-          cp scripts/install.sh "$package_dir/install.sh"
-          cp scripts/install-openrc.sh "$package_dir/install-openrc.sh"
-          cp scripts/lib/install-common.sh "$package_dir/lib/install-common.sh"
-          cp scripts/upgrade.sh "$package_dir/upgrade.sh"
-          cp packaging/systemd/noders-anytls.service "$package_dir/packaging/systemd/noders-anytls.service"
-          chmod +x "$package_dir/install.sh" "$package_dir/install-openrc.sh" "$package_dir/upgrade.sh" "$package_dir/${BIN_NAME}"
-          tar -C dist -czf "${package_dir}.tar.gz" "$(basename "$package_dir")"
-          sha256sum "${package_dir}.tar.gz" > "${package_dir}.tar.gz.sha256"
+          bash scripts/package-release-bundle.sh \
+            --release-tag "${RELEASE_TAG:-dev}" \
+            --target x86_64-unknown-linux-musl \
+            --asset-suffix linux-amd64-musl
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-bundle-${{ matrix.asset_suffix }}
+          name: linux-release-bundle-linux-amd64-musl
           path: dist/*
           if-no-files-found: error
 
   publish:
     name: Publish Linux release assets
-    needs: build
+    needs: [build-gnu, build-musl]
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch'
     steps:

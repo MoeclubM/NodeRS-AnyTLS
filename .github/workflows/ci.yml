@@ -37,6 +37,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Build release binaries
+        run: cargo build --locked --release --bin noders-anytls --bin bench_anytls
+
+      - name: Run perf smoke benchmark
+        run: |
+          python3 scripts/perf_smoke.py \
+            --binary-dir target/release \
+            --output-dir target/perf-smoke
+
+      - name: Upload perf smoke artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-smoke
+          path: target/perf-smoke
+          if-no-files-found: error
+
+  musl-compat:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install Rust toolchain with musl target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,19 +86,5 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
-      - name: Build musl release binaries
+      - name: Build musl compatibility binaries
         run: cargo build --locked --release --target x86_64-unknown-linux-musl --bin noders-anytls --bin bench_anytls
-
-      - name: Run perf smoke benchmark
-        run: |
-          python3 scripts/perf_smoke.py \
-            --binary-dir target/x86_64-unknown-linux-musl/release \
-            --output-dir target/perf-smoke
-
-      - name: Upload perf smoke artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-smoke
-          path: target/perf-smoke
-          if-no-files-found: error

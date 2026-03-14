@@ -14,6 +14,8 @@ target/
 benchmark/
 .tmpbench/
 .tmpbench2/
+__pycache__/
+*.pyc
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

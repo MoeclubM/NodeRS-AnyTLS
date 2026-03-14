@@ -1,9 +1,6 @@
-#[path = "../allocator.rs"]
-mod allocator;
-
 use anyhow::{Context, bail, ensure};
 use md5::{Digest as Md5Digest, Md5};
-use rand::Rng;
+use rand::RngExt;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
@@ -691,7 +688,8 @@ fn network_delay(impairment: ImpairmentProfile) -> Option<Duration> {
     let base = impairment.latency.as_millis() as i64;
     let jitter = impairment.jitter.as_millis() as i64;
     let jitter_offset = if jitter > 0 {
-        rand::thread_rng().gen_range(-jitter..=jitter)
+        let mut rng = rand::rng();
+        rng.random_range(-jitter..=jitter)
     } else {
         0
     };
@@ -704,12 +702,12 @@ fn network_delay(impairment: ImpairmentProfile) -> Option<Duration> {
 }
 
 fn should_drop_datagram(impairment: ImpairmentProfile) -> bool {
-    impairment.loss_rate > 0.0 && rand::thread_rng().gen_bool(impairment.loss_rate)
+    impairment.loss_rate > 0.0 && rand::rng().random_bool(impairment.loss_rate)
 }
 
 fn tcp_forward_delay(impairment: ImpairmentProfile) -> Option<Duration> {
     let mut delay = network_delay(impairment).unwrap_or_default();
-    if impairment.stall_rate > 0.0 && rand::thread_rng().gen_bool(impairment.stall_rate) {
+    if impairment.stall_rate > 0.0 && rand::rng().random_bool(impairment.stall_rate) {
         delay += impairment.stall;
     }
     if delay.is_zero() { None } else { Some(delay) }
