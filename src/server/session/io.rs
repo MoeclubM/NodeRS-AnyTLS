@@ -16,10 +16,12 @@ use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
     MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
-    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
-    download_coalesce_target, upload_batch_policy,
+    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target,
+    upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame};
+
+const GNU_SCALAR_SINGLE_CHUNK_MAX_LEN: usize = 256;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
@@ -211,10 +213,13 @@ where
     let Some(front) = chunks.front() else {
         return Ok(0);
     };
-    // GNU consistently benefits from bypassing write_vectored for tiny single-chunk uploads.
-    // Musl has not shown the same win, so keep it on the regular vectored path there.
+    // GNU consistently benefits from bypassing write_vectored for truly tiny single-chunk
+    // uploads. Keep 1 KiB-class payloads on the batched path so small-concurrency workloads
+    // still get the iovec fan-out win.
     #[cfg(not(target_env = "musl"))]
-    if chunks.len() == 1 && front.len().saturating_sub(front_offset) <= SMALL_PAYLOAD_LEN {
+    if chunks.len() == 1
+        && front.len().saturating_sub(front_offset) <= GNU_SCALAR_SINGLE_CHUNK_MAX_LEN
+    {
         return writer
             .write(&front.bytes()[front_offset..])
             .await
