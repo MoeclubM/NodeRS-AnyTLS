@@ -309,6 +309,19 @@ impl ChannelReader {
         }
     }
 
+    pub(super) fn from_parts(
+        current: Option<BufferedChunk>,
+        rx: mpsc::Receiver<InboundMessage>,
+        finished: bool,
+    ) -> Self {
+        Self {
+            rx,
+            current,
+            offset: 0,
+            finished,
+        }
+    }
+
     pub(super) fn into_parts(
         self,
     ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {

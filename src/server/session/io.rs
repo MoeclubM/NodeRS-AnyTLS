@@ -1,4 +1,4 @@
-use anyhow::{Context, ensure};
+use anyhow::Context;
 use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::io::IoSlice;
@@ -12,7 +12,7 @@ use crate::accounting::SessionControl;
 
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
-use super::channel::{BufferedChunk, InboundMessage};
+use super::channel::{BufferedChunk, ChannelReader, InboundMessage};
 use super::frame::{
     CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, download_coalesce_target,
@@ -21,9 +21,9 @@ use super::frame::{
 use super::writer::{FrameWriter, write_frame};
 
 pub(super) async fn pump_inbound_to_remote<W>(
-    mut pending: Option<BufferedChunk>,
-    mut rx: mpsc::Receiver<InboundMessage>,
-    mut finished: bool,
+    pending: Option<BufferedChunk>,
+    rx: mpsc::Receiver<InboundMessage>,
+    finished: bool,
     writer: &mut W,
     control: Arc<SessionControl>,
     traffic: Option<TrafficRecorder>,
@@ -31,81 +31,8 @@ pub(super) async fn pump_inbound_to_remote<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut chunks: VecDeque<BufferedChunk> = VecDeque::with_capacity(MAX_UPLOAD_BATCH_IOVECS);
-    let mut front_offset = 0usize;
-    let mut queued_bytes = 0usize;
-    let mut total = 0u64;
-    loop {
-        if control.is_cancelled() {
-            return Ok(total);
-        }
-        if let Some(chunk) = pending.take() {
-            queued_bytes += chunk.len();
-            chunks.push_back(chunk);
-            front_offset = 0;
-        }
-        let policy = upload_batch_policy_for_chunks(&chunks);
-        while queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !finished {
-            match rx.try_recv() {
-                Ok(InboundMessage::Data(chunk)) => {
-                    if chunks.is_empty()
-                        || (queued_bytes + chunk.len() <= policy.max_bytes
-                            && chunks.len() < policy.max_iovecs)
-                    {
-                        queued_bytes += chunk.len();
-                        chunks.push_back(chunk);
-                    } else {
-                        pending = Some(chunk);
-                        break;
-                    }
-                }
-                Ok(InboundMessage::Fin) => {
-                    finished = true;
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
-        }
-        if chunks.is_empty() {
-            if finished {
-                let _ = writer.shutdown().await;
-                return Ok(total);
-            }
-            match tokio::select! {
-                _ = control.cancelled() => return Ok(total),
-                message = rx.recv() => message,
-            } {
-                Some(InboundMessage::Data(chunk)) => {
-                    pending = Some(chunk);
-                    continue;
-                }
-                Some(InboundMessage::Fin) | None => {
-                    let _ = writer.shutdown().await;
-                    return Ok(total);
-                }
-            }
-        }
-        let written = tokio::select! {
-            _ = control.cancelled() => return Ok(total),
-            result = write_chunk_batch(writer, &chunks, front_offset, policy) => result?,
-        };
-        ensure!(written > 0, "write inbound batch returned zero bytes");
-        advance_chunk_batch(&mut chunks, &mut front_offset, written);
-        queued_bytes = queued_bytes.saturating_sub(written);
-        let transferred = written as u64;
-        total += transferred;
-        if let Some(traffic) = traffic.as_ref() {
-            traffic.record(transferred);
-        }
-        if finished && pending.is_none() && chunks.is_empty() {
-            let _ = writer.shutdown().await;
-            return Ok(total);
-        }
-    }
+    let mut reader = ChannelReader::from_parts(pending, rx, finished);
+    pump_copy(&mut reader, writer, control, traffic, None).await
 }
 
 pub(super) async fn pump_copy<R, W>(
@@ -193,40 +120,6 @@ where
             return Ok(total);
         }
     }
-}
-
-async fn write_chunk_batch<W>(
-    writer: &mut W,
-    chunks: &VecDeque<BufferedChunk>,
-    front_offset: usize,
-    policy: super::frame::UploadBatchPolicy,
-) -> anyhow::Result<usize>
-where
-    W: AsyncWrite + Unpin,
-{
-    if chunks.is_empty() {
-        return Ok(0);
-    }
-    if writer.is_write_vectored() {
-        let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
-            std::array::from_fn(|_| IoSlice::new(&[]));
-        let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
-        if count == 0 {
-            return Ok(0);
-        }
-        return writer
-            .write_vectored(&slices[..count])
-            .await
-            .context("write inbound chunk batch");
-    }
-
-    let Some(front) = chunks.front() else {
-        return Ok(0);
-    };
-    writer
-        .write(&front.bytes()[front_offset..])
-        .await
-        .context("write inbound chunk")
 }
 
 fn upload_batch_policy_for_chunks(
