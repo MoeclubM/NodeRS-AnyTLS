@@ -14,8 +14,9 @@ use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 use super::frame::{
-    CMD_FIN, CMD_PSH, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
-    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
+    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
+    MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
+    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
     download_coalesce_target, upload_batch_policy,
 };
 use super::writer::{FrameWriter, write_frame};
@@ -217,22 +218,73 @@ where
             .context("write inbound chunk");
     }
     if writer.is_write_vectored() {
-        let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
-            std::array::from_fn(|_| IoSlice::new(&[]));
-        let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
-        if count == 0 {
-            return Ok(0);
+        match policy.max_iovecs {
+            SMALL_UPLOAD_BATCH_IOVECS => {
+                return write_chunk_batch_vectored::<_, SMALL_UPLOAD_BATCH_IOVECS>(
+                    writer,
+                    chunks,
+                    front_offset,
+                    policy,
+                )
+                .await;
+            }
+            DEFAULT_UPLOAD_BATCH_IOVECS => {
+                return write_chunk_batch_vectored::<_, DEFAULT_UPLOAD_BATCH_IOVECS>(
+                    writer,
+                    chunks,
+                    front_offset,
+                    policy,
+                )
+                .await;
+            }
+            LARGE_UPLOAD_BATCH_IOVECS => {
+                return write_chunk_batch_vectored::<_, LARGE_UPLOAD_BATCH_IOVECS>(
+                    writer,
+                    chunks,
+                    front_offset,
+                    policy,
+                )
+                .await;
+            }
+            _ => {
+                let mut slices: [IoSlice<'_>; MAX_UPLOAD_BATCH_IOVECS] =
+                    std::array::from_fn(|_| IoSlice::new(&[]));
+                let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
+                if count == 0 {
+                    return Ok(0);
+                }
+                return writer
+                    .write_vectored(&slices[..count])
+                    .await
+                    .context("write inbound chunk batch");
+            }
         }
-        return writer
-            .write_vectored(&slices[..count])
-            .await
-            .context("write inbound chunk batch");
     }
 
     writer
         .write(&front.bytes()[front_offset..])
         .await
         .context("write inbound chunk")
+}
+
+async fn write_chunk_batch_vectored<W, const N: usize>(
+    writer: &mut W,
+    chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
+    policy: super::frame::UploadBatchPolicy,
+) -> anyhow::Result<usize>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut slices: [IoSlice<'_>; N] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let count = fill_chunk_batch_slices(chunks, front_offset, &mut slices, policy);
+    if count == 0 {
+        return Ok(0);
+    }
+    writer
+        .write_vectored(&slices[..count])
+        .await
+        .context("write inbound chunk batch")
 }
 
 #[cfg(test)]
