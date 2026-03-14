@@ -30,7 +30,9 @@ impl PaddingScheme {
 
     pub fn from_lines(lines: &[String]) -> anyhow::Result<Self> {
         validate_scheme(lines)?;
-        Ok(Self { raw: lines.to_vec() })
+        Ok(Self {
+            raw: lines.to_vec(),
+        })
     }
 
     pub fn raw_lines(&self) -> &[String] {
