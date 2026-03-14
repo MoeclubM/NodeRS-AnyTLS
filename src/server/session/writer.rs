@@ -1,6 +1,7 @@
 use anyhow::{Context, bail, ensure};
 use std::collections::VecDeque;
 use std::io::IoSlice;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
@@ -218,11 +219,22 @@ async fn write_compact_frame<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let mut buffer = [0u8; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
-    buffer[..7].copy_from_slice(header);
-    buffer[7..7 + payload.len()].copy_from_slice(payload);
+    let mut buffer = [const { MaybeUninit::<u8>::uninit() }; 7 + COMPACT_FRAME_PAYLOAD_THRESHOLD];
+    for (slot, byte) in buffer[..7].iter_mut().zip(header.iter().copied()) {
+        slot.write(byte);
+    }
+    for (slot, byte) in buffer[7..7 + payload.len()]
+        .iter_mut()
+        .zip(payload.iter().copied())
+    {
+        slot.write(byte);
+    }
+    let initialized = unsafe {
+        // SAFETY: exactly the prefix `[0..7 + payload.len())` is initialized above.
+        std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), 7 + payload.len())
+    };
     writer
-        .write_all(&buffer[..7 + payload.len()])
+        .write_all(initialized)
         .await
         .context("write compact session frame")
 }
@@ -528,6 +540,20 @@ mod tests {
             .expect("write frame buffers");
         assert_eq!(writer.bytes, b"helloworld!");
         assert!(writer.write_vectored_calls >= 3);
+    }
+
+    #[tokio::test]
+    async fn compact_frame_write_emits_exact_header_and_payload_bytes() {
+        let mut writer = MockWriter::default();
+        let header = build_frame_header(CMD_PSH, 7, 5);
+
+        write_compact_frame(&mut writer, &header, b"hello")
+            .await
+            .expect("write compact frame");
+
+        let mut expected = header.to_vec();
+        expected.extend_from_slice(b"hello");
+        assert_eq!(writer.bytes, expected);
     }
 
     #[test]
