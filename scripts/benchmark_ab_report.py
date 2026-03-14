@@ -67,12 +67,20 @@ NETEM_PROFILES = {
     "lossy-small": ["delay", "15ms", "3ms", "loss", "0.5%"],
 }
 
+FIXED_COMPARE_TAGS = ["v0.0.23", "v0.0.18"]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current NodeRS, previous tags, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target", default="x86_64-unknown-linux-gnu")
-    parser.add_argument("--compare-count", type=int, default=3)
+    parser.add_argument(
+        "--compare-count",
+        type=int,
+        default=3,
+        help="Total number of previous tags to benchmark. The default keeps fixed baselines "
+        "v0.0.23 and v0.0.18, then adds the latest previous tag.",
+    )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
     return parser.parse_args()
@@ -116,6 +124,9 @@ def run_best_effort(
 
 
 def select_previous_tags(limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+
     head_tags = set(filter(None, git_output("tag", "--points-at", "HEAD").splitlines()))
     tags = [
         line.strip()
@@ -123,8 +134,16 @@ def select_previous_tags(limit: int) -> list[str]:
         if line.strip().startswith("v")
     ]
     selected: list[str] = []
-    for tag in tags:
-        if tag in head_tags:
+    available = [tag for tag in tags if tag not in head_tags]
+
+    for tag in FIXED_COMPARE_TAGS:
+        if tag in available and tag not in selected:
+            selected.append(tag)
+            if len(selected) >= limit:
+                return selected
+
+    for tag in available:
+        if tag in selected:
             continue
         selected.append(tag)
         if len(selected) >= limit:
