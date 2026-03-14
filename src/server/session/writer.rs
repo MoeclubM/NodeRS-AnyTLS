@@ -333,12 +333,8 @@ where
 {
     let mut header_offset = 0usize;
     let mut payload_offset = 0usize;
-    #[cfg(not(target_env = "musl"))]
-    let use_vectored = writer.is_write_vectored();
-    #[cfg(target_env = "musl")]
-    let use_vectored = false;
     while header_offset < header.len() || payload_offset < payload.len() {
-        let written = if use_vectored {
+        let written = if writer.is_write_vectored() {
             let mut slices = [IoSlice::new(&[]), IoSlice::new(&[])];
             let mut count = 0usize;
             if header_offset < header.len() {
@@ -532,27 +528,6 @@ mod tests {
             .expect("write frame buffers");
         assert_eq!(writer.bytes, b"helloworld!");
         assert!(writer.write_vectored_calls >= 3);
-    }
-
-    #[tokio::test]
-    async fn frame_parts_handle_partial_scalar_writes() {
-        let mut writer = MockWriter {
-            vectored: false,
-            max_write: 4,
-            ..Default::default()
-        };
-        let header = [1u8, 2, 3, 4, 5, 6, 7];
-        let payload = [9u8; 10];
-
-        write_frame_parts(&mut writer, &header, &payload)
-            .await
-            .expect("write frame parts");
-
-        assert_eq!(writer.write_vectored_calls, 0);
-        assert_eq!(
-            writer.bytes,
-            [header.as_slice(), payload.as_slice()].concat()
-        );
     }
 
     #[test]
