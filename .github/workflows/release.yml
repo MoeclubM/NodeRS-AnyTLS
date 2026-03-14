@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build GNU release binary in manylinux2014
         shell: bash
@@ -57,7 +57,7 @@ jobs:
             '
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-release-bundle-linux-amd64
           path: dist/*
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain with musl target
         uses: dtolnay/rust-toolchain@stable
@@ -107,7 +107,7 @@ jobs:
             --asset-suffix linux-amd64-musl
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-release-bundle-linux-amd64-musl
           path: dist/*
@@ -120,7 +120,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch'
     steps:
       - name: Download packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
