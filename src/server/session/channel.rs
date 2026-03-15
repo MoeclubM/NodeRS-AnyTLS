@@ -230,17 +230,17 @@ impl InboundSender {
             .small_budget_cache
             .lock()
             .expect("sender budget cache lock poisoned");
-        if cache.reserved < len {
-            let needed = len - cache.reserved;
+        if let Err(needed) = cache.try_take(len) {
             let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
             if self.budget.try_reserve(grant).is_ok() {
-                cache.reserved += grant;
+                cache.add_reserved_and_take(grant, len);
             } else {
                 self.budget.try_reserve(needed)?;
-                cache.reserved += needed;
+                cache.add_reserved_and_take(needed, len);
             }
+        } else {
+            return Ok(ByteBudgetPermit::new(self.budget.clone(), len));
         }
-        cache.reserved -= len;
         Ok(ByteBudgetPermit::new(self.budget.clone(), len))
     }
 
@@ -254,50 +254,33 @@ impl InboundSender {
         }
 
         loop {
-            {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                if cache.reserved >= len {
-                    cache.reserved -= len;
-                    return Some(ByteBudgetPermit::new(self.budget.clone(), len));
-                }
-            }
-
             let needed = {
-                let cache = self
+                let mut cache = self
                     .small_budget_cache
                     .lock()
                     .expect("sender budget cache lock poisoned");
-                len - cache.reserved
+                match cache.try_take(len) {
+                    Ok(()) => return Some(ByteBudgetPermit::new(self.budget.clone(), len)),
+                    Err(needed) => {
+                        let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
+                        if self.budget.try_reserve(grant).is_ok() {
+                            cache.add_reserved_and_take(grant, len);
+                            return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+                        }
+                        if grant != needed && self.budget.try_reserve(needed).is_ok() {
+                            cache.add_reserved_and_take(needed, len);
+                            return Some(ByteBudgetPermit::new(self.budget.clone(), len));
+                        }
+                        needed
+                    }
+                }
             };
-            let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
-            if self.budget.try_reserve(grant).is_ok() {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                cache.reserved += grant;
-                cache.reserved -= len;
-                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
-            }
-            if grant != needed && self.budget.try_reserve(needed).is_ok() {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
-                cache.reserved += needed;
-                cache.reserved -= len;
-                return Some(ByteBudgetPermit::new(self.budget.clone(), len));
-            }
             self.budget.acquire(needed, &self.tx).await?;
             let mut cache = self
                 .small_budget_cache
                 .lock()
                 .expect("sender budget cache lock poisoned");
-            cache.reserved += needed;
-            cache.reserved -= len;
+            cache.add_reserved_and_take(needed, len);
             return Some(ByteBudgetPermit::new(self.budget.clone(), len));
         }
     }
@@ -389,6 +372,21 @@ impl SenderBudgetCache {
             budget,
             reserved: 0,
         }
+    }
+
+    fn try_take(&mut self, len: usize) -> Result<(), usize> {
+        if self.reserved >= len {
+            self.reserved -= len;
+            Ok(())
+        } else {
+            Err(len - self.reserved)
+        }
+    }
+
+    fn add_reserved_and_take(&mut self, added: usize, len: usize) {
+        self.reserved += added;
+        debug_assert!(self.reserved >= len);
+        self.reserved -= len;
     }
 }
 
