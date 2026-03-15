@@ -23,10 +23,6 @@ use super::writer::{FrameWriter, write_frame};
 
 #[cfg(target_env = "musl")]
 const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
-#[cfg(target_env = "musl")]
-const SMALL_MUSL_UPLOAD_BATCH_IOVECS: usize = 16;
-#[cfg(target_env = "musl")]
-const MEDIUM_MUSL_UPLOAD_BATCH_IOVECS: usize = 32;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
@@ -229,48 +225,18 @@ where
     }
     if writer.is_write_vectored() {
         #[cfg(target_env = "musl")]
-        if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS {
-            // Musl small-upload batches benefit from staying off the full staging array when
-            // only a handful of slices are present, but large small-tier batches still need the
-            // wider fan-out to avoid fragmenting upload throughput.
-            return match musl_small_upload_iovecs(chunks.len()) {
-                TINY_UPLOAD_BATCH_IOVECS => {
-                    write_chunk_batch_vectored::<_, TINY_UPLOAD_BATCH_IOVECS>(
-                        writer,
-                        chunks,
-                        front_offset,
-                        policy,
-                    )
-                    .await
-                }
-                SMALL_MUSL_UPLOAD_BATCH_IOVECS => {
-                    write_chunk_batch_vectored::<_, SMALL_MUSL_UPLOAD_BATCH_IOVECS>(
-                        writer,
-                        chunks,
-                        front_offset,
-                        policy,
-                    )
-                    .await
-                }
-                MEDIUM_MUSL_UPLOAD_BATCH_IOVECS => {
-                    write_chunk_batch_vectored::<_, MEDIUM_MUSL_UPLOAD_BATCH_IOVECS>(
-                        writer,
-                        chunks,
-                        front_offset,
-                        policy,
-                    )
-                    .await
-                }
-                _ => {
-                    write_chunk_batch_vectored::<_, SMALL_UPLOAD_BATCH_IOVECS>(
-                        writer,
-                        chunks,
-                        front_offset,
-                        policy,
-                    )
-                    .await
-                }
-            };
+        if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
+            && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS
+        {
+            // Musl benefits from keeping tiny small-upload batches off the 96-slot IoSlice
+            // staging path while still using write_vectored for single-chunk uploads.
+            return write_chunk_batch_vectored::<_, TINY_UPLOAD_BATCH_IOVECS>(
+                writer,
+                chunks,
+                front_offset,
+                policy,
+            )
+            .await;
         }
         match policy.max_iovecs {
             SMALL_UPLOAD_BATCH_IOVECS => {
@@ -319,19 +285,6 @@ where
         .write(&front.bytes()[front_offset..])
         .await
         .context("write inbound chunk")
-}
-
-#[cfg(target_env = "musl")]
-fn musl_small_upload_iovecs(chunk_count: usize) -> usize {
-    if chunk_count <= TINY_UPLOAD_BATCH_IOVECS {
-        TINY_UPLOAD_BATCH_IOVECS
-    } else if chunk_count <= SMALL_MUSL_UPLOAD_BATCH_IOVECS {
-        SMALL_MUSL_UPLOAD_BATCH_IOVECS
-    } else if chunk_count <= MEDIUM_MUSL_UPLOAD_BATCH_IOVECS {
-        MEDIUM_MUSL_UPLOAD_BATCH_IOVECS
-    } else {
-        SMALL_UPLOAD_BATCH_IOVECS
-    }
 }
 
 async fn write_chunk_batch_vectored<W, const N: usize>(
@@ -529,11 +482,6 @@ pub(super) fn chunk_batch_policy(
     chunks: &VecDeque<BufferedChunk>,
 ) -> super::frame::UploadBatchPolicy {
     upload_batch_policy_for_chunks(chunks)
-}
-
-#[cfg(all(test, target_env = "musl"))]
-pub(super) fn musl_small_upload_iovecs_for_test(chunk_count: usize) -> usize {
-    musl_small_upload_iovecs(chunk_count)
 }
 
 pub(super) fn advance_chunk_batch(

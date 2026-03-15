@@ -687,8 +687,6 @@ mod tests {
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
-    #[cfg(target_env = "musl")]
-    use super::io::musl_small_upload_iovecs_for_test;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         pump_copy, write_chunk_batch_for_test,
@@ -1244,21 +1242,6 @@ mod tests {
         assert_eq!(written, 5);
         assert_eq!(writer.scalar_writes, 0);
         assert_eq!(writer.vectored_writes, 1);
-    }
-
-    #[cfg(target_env = "musl")]
-    #[test]
-    fn musl_small_upload_batches_use_tiered_iovec_staging() {
-        assert_eq!(musl_small_upload_iovecs_for_test(1), 4);
-        assert_eq!(musl_small_upload_iovecs_for_test(4), 4);
-        assert_eq!(musl_small_upload_iovecs_for_test(5), 16);
-        assert_eq!(musl_small_upload_iovecs_for_test(16), 16);
-        assert_eq!(musl_small_upload_iovecs_for_test(17), 32);
-        assert_eq!(musl_small_upload_iovecs_for_test(32), 32);
-        assert_eq!(
-            musl_small_upload_iovecs_for_test(33),
-            upload_batch_policy(1).max_iovecs
-        );
     }
 
     #[tokio::test]
