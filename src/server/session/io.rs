@@ -46,29 +46,30 @@ where
             front_offset = 0;
         }
         let policy = upload_batch_policy_for_chunks(&chunks);
-        let mut filled_ready = fill_ready_upload_batch(
-            &mut rx,
-            &mut chunks,
-            &mut pending,
-            &mut queued_bytes,
-            &mut finished,
-            policy,
-        );
-        if !filled_ready
-            && !finished
-            && chunks.len() == 1
-            && queued_bytes < SMALL_DATA_FRAME_FLUSH_THRESHOLD
-            && policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
-        {
-            tokio::task::yield_now().await;
-            filled_ready = fill_ready_upload_batch(
-                &mut rx,
-                &mut chunks,
-                &mut pending,
-                &mut queued_bytes,
-                &mut finished,
-                policy,
-            );
+        while queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !finished {
+            match rx.try_recv() {
+                Ok(InboundMessage::Data(chunk)) => {
+                    if chunks.is_empty()
+                        || (queued_bytes + chunk.len() <= policy.max_bytes
+                            && chunks.len() < policy.max_iovecs)
+                    {
+                        queued_bytes += chunk.len();
+                        chunks.push_back(chunk);
+                    } else {
+                        pending = Some(chunk);
+                        break;
+                    }
+                }
+                Ok(InboundMessage::Fin) => {
+                    finished = true;
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
         }
         if chunks.is_empty() {
             if finished {
@@ -106,44 +107,6 @@ where
             return Ok(total);
         }
     }
-}
-
-fn fill_ready_upload_batch(
-    rx: &mut mpsc::Receiver<InboundMessage>,
-    chunks: &mut VecDeque<BufferedChunk>,
-    pending: &mut Option<BufferedChunk>,
-    queued_bytes: &mut usize,
-    finished: &mut bool,
-    policy: super::frame::UploadBatchPolicy,
-) -> bool {
-    let mut filled_any = false;
-    while *queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !*finished {
-        match rx.try_recv() {
-            Ok(InboundMessage::Data(chunk)) => {
-                if chunks.is_empty()
-                    || (*queued_bytes + chunk.len() <= policy.max_bytes
-                        && chunks.len() < policy.max_iovecs)
-                {
-                    *queued_bytes += chunk.len();
-                    chunks.push_back(chunk);
-                    filled_any = true;
-                } else {
-                    *pending = Some(chunk);
-                    break;
-                }
-            }
-            Ok(InboundMessage::Fin) => {
-                *finished = true;
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                *finished = true;
-                break;
-            }
-        }
-    }
-    filled_any
 }
 
 pub(super) async fn pump_copy<R, W>(

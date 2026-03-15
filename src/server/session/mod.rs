@@ -686,7 +686,7 @@ mod tests {
     };
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
-        pump_copy, pump_inbound_to_remote, write_chunk_batch_for_test,
+        pump_copy, write_chunk_batch_for_test,
     };
     use super::read_exact_payload;
     use crate::accounting::{Accounting, SessionControl};
@@ -1160,36 +1160,6 @@ mod tests {
                 .expect("write large single chunk batch");
 
         assert_eq!(written, payload.len());
-        assert_eq!(writer.scalar_writes, 0);
-        assert_eq!(writer.vectored_writes, 1);
-    }
-
-    #[tokio::test]
-    async fn small_upload_batch_retries_after_one_scheduler_yield() {
-        let (tx, rx) = mpsc::channel(8);
-        let control = SessionControl::new();
-        let mut writer = WriteModeRecorder::default();
-
-        let sender = tokio::spawn(async move {
-            tx.send(InboundMessage::Data(test_chunk(b"world")))
-                .await
-                .expect("send second chunk");
-            tx.send(InboundMessage::Fin).await.expect("send fin");
-        });
-
-        let transferred = pump_inbound_to_remote(
-            Some(test_chunk(b"hello")),
-            rx,
-            false,
-            &mut writer,
-            control,
-            None,
-        )
-        .await
-        .expect("pump inbound");
-
-        sender.await.expect("join sender");
-        assert_eq!(transferred, 10);
         assert_eq!(writer.scalar_writes, 0);
         assert_eq!(writer.vectored_writes, 1);
     }
