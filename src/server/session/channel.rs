@@ -1,7 +1,8 @@
+use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Notify, mpsc};
@@ -28,7 +29,7 @@ impl PayloadPool {
     }
 
     pub(super) fn take(self: &Arc<Self>, len: usize) -> PayloadBuffer {
-        let mut buffers = self.buffers.lock().expect("payload pool lock poisoned");
+        let mut buffers = self.buffers.lock();
         // Hot paths usually recycle the same buffer sizes repeatedly. Reusing the most recent
         // buffer first avoids scanning the whole cache on every small frame, and only falls
         // back to a linear search when that hot buffer is too small for the next payload.
@@ -55,7 +56,7 @@ impl PayloadPool {
 
     fn recycle(&self, mut bytes: Vec<u8>) {
         bytes.clear();
-        let mut buffers = self.buffers.lock().expect("payload pool lock poisoned");
+        let mut buffers = self.buffers.lock();
         if buffers.len() < self.max_cached {
             buffers.push(bytes);
         }
@@ -128,11 +129,6 @@ pub(super) struct BufferedChunk {
     permit: ByteBudgetPermit,
 }
 
-pub(super) struct BudgetReleaseBatch {
-    budget: Option<Arc<ByteBudget>>,
-    len: usize,
-}
-
 impl BufferedChunk {
     fn new(payload: PayloadBuffer, permit: ByteBudgetPermit) -> Self {
         Self { payload, permit }
@@ -156,30 +152,6 @@ impl BufferedChunk {
         Self {
             payload: PayloadBuffer::new(bytes),
             permit: self.permit,
-        }
-    }
-
-    pub(super) fn add_budget_release(&mut self, batch: &mut BudgetReleaseBatch) {
-        if let Some((budget, len)) = self.permit.take_release() {
-            if batch.budget.is_none() {
-                batch.budget = Some(budget);
-            }
-            batch.len += len;
-        }
-    }
-}
-
-impl BudgetReleaseBatch {
-    pub(super) fn new() -> Self {
-        Self {
-            budget: None,
-            len: 0,
-        }
-    }
-
-    pub(super) fn flush(self) {
-        if let Some(budget) = self.budget {
-            budget.release(self.len);
         }
     }
 }
@@ -255,10 +227,7 @@ impl InboundSender {
             return Ok(ByteBudgetPermit::new(self.budget.clone(), len));
         }
 
-        let mut cache = self
-            .small_budget_cache
-            .lock()
-            .expect("sender budget cache lock poisoned");
+        let mut cache = self.small_budget_cache.lock();
         if let Err(needed) = cache.try_take(len) {
             let grant = SMALL_DATA_FRAME_FLUSH_THRESHOLD.max(needed);
             if self.budget.try_reserve(grant).is_ok() {
@@ -284,10 +253,7 @@ impl InboundSender {
 
         loop {
             let needed = {
-                let mut cache = self
-                    .small_budget_cache
-                    .lock()
-                    .expect("sender budget cache lock poisoned");
+                let mut cache = self.small_budget_cache.lock();
                 match cache.try_take(len) {
                     Ok(()) => return Some(ByteBudgetPermit::new(self.budget.clone(), len)),
                     Err(needed) => {
@@ -305,10 +271,7 @@ impl InboundSender {
                 }
             };
             self.budget.acquire(needed, &self.tx).await?;
-            let mut cache = self
-                .small_budget_cache
-                .lock()
-                .expect("sender budget cache lock poisoned");
+            let mut cache = self.small_budget_cache.lock();
             cache.add_reserved_and_take(needed, len);
             return Some(ByteBudgetPermit::new(self.budget.clone(), len));
         }
@@ -379,7 +342,7 @@ impl ByteBudget {
         }
     }
 
-    pub(super) fn release(&self, len: usize) {
+    fn release(&self, len: usize) {
         if len == 0 {
             return;
         }
@@ -434,13 +397,6 @@ struct ByteBudgetPermit {
 impl ByteBudgetPermit {
     fn new(budget: Arc<ByteBudget>, len: usize) -> Self {
         Self { budget, len }
-    }
-
-    fn take_release(&mut self) -> Option<(Arc<ByteBudget>, usize)> {
-        if self.len == 0 {
-            return None;
-        }
-        Some((self.budget.clone(), std::mem::take(&mut self.len)))
     }
 }
 
@@ -671,7 +627,7 @@ mod tests {
     fn payload_pool_scans_older_buffer_when_recent_one_is_too_small() {
         let pool = Arc::new(PayloadPool::new(4));
         {
-            let mut buffers = pool.buffers.lock().expect("pool lock");
+            let mut buffers = pool.buffers.lock();
             buffers.push(Vec::with_capacity(128));
             buffers.push(Vec::with_capacity(8));
         }
@@ -680,7 +636,7 @@ mod tests {
         assert_eq!(reused.bytes.len(), 0);
         assert!(reused.bytes.capacity() >= 128);
 
-        let buffers = pool.buffers.lock().expect("pool lock");
+        let buffers = pool.buffers.lock();
         assert_eq!(buffers.len(), 1);
         assert!(buffers[0].capacity() >= 8);
     }

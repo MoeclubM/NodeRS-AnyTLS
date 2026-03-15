@@ -1,4 +1,5 @@
 use anyhow::{Context, bail, ensure};
+use parking_lot::Mutex as SyncMutex;
 use std::collections::VecDeque;
 use std::io::IoSlice;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ struct PendingCompactFrame {
 #[derive(Clone)]
 pub(super) struct FrameWriter {
     inner: Arc<Mutex<WriteHalf<TlsStream>>>,
-    pending_compact: Arc<std::sync::Mutex<VecDeque<PendingCompactFrame>>>,
+    pending_compact: Arc<SyncMutex<VecDeque<PendingCompactFrame>>>,
     // Large writes frequently touch this path when no compact frames are queued.
     // Tracking the queue length atomically avoids taking the mutex in that case.
     pending_compact_len: Arc<AtomicUsize>,
@@ -48,7 +49,7 @@ impl FrameWriter {
     pub(super) fn spawn(writer: WriteHalf<TlsStream>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(writer)),
-            pending_compact: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+            pending_compact: Arc::new(SyncMutex::new(VecDeque::new())),
             pending_compact_len: Arc::new(AtomicUsize::new(0)),
             pending_compact_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -178,11 +179,11 @@ fn compact_contention_strategy(cmd: u8, payload_len: usize) -> CompactContention
 }
 
 fn enqueue_pending_compact_frame(
-    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending: &SyncMutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     frame: PendingCompactFrame,
 ) -> anyhow::Result<()> {
-    let mut guard = pending.lock().expect("pending compact queue poisoned");
+    let mut guard = pending.lock();
     if guard.len() >= MAX_PENDING_COMPACT_FRAMES {
         bail!("pending compact frame queue full");
     }
@@ -198,7 +199,7 @@ fn claim_pending_compact_driver(driver: &std::sync::atomic::AtomicBool) -> bool 
 }
 
 async fn drain_pending_compact_frames_if_any<W>(
-    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending: &SyncMutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     writer: &mut W,
 ) -> anyhow::Result<PendingDrain>
@@ -212,7 +213,7 @@ where
 }
 
 async fn drain_pending_compact_frames<W>(
-    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending: &SyncMutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     writer: &mut W,
 ) -> anyhow::Result<PendingDrain>
@@ -220,7 +221,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let frames = {
-        let mut guard = pending.lock().expect("pending compact queue poisoned");
+        let mut guard = pending.lock();
         guard.drain(..).collect::<Vec<_>>()
     };
     if frames.is_empty() {
@@ -247,7 +248,7 @@ where
 }
 
 async fn drive_pending_compact_frames<W>(
-    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending: &SyncMutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     driver: &std::sync::atomic::AtomicBool,
     writer: &mut W,
@@ -282,12 +283,12 @@ where
 }
 
 fn fail_pending_compact_frames(
-    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending: &SyncMutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     error: &anyhow::Error,
 ) {
     let frames = {
-        let mut guard = pending.lock().expect("pending compact queue poisoned");
+        let mut guard = pending.lock();
         guard.drain(..).collect::<Vec<_>>()
     };
     if frames.is_empty() {
@@ -550,8 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn draining_large_pending_frames_does_not_request_flush() {
-        let pending =
-            std::sync::Mutex::new(VecDeque::from([pending_compact_frame(6 * 1024, false)]));
+        let pending = SyncMutex::new(VecDeque::from([pending_compact_frame(6 * 1024, false)]));
         let pending_len = AtomicUsize::new(1);
         let mut writer = MockWriter {
             vectored: true,
@@ -570,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn draining_small_pending_frames_requests_flush() {
-        let pending = std::sync::Mutex::new(VecDeque::from([pending_compact_frame(1024, true)]));
+        let pending = SyncMutex::new(VecDeque::from([pending_compact_frame(1024, true)]));
         let pending_len = AtomicUsize::new(1);
         let mut writer = MockWriter {
             vectored: true,
@@ -589,7 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn skipping_drain_when_no_pending_frames_avoids_work() {
-        let pending = std::sync::Mutex::new(VecDeque::new());
+        let pending = SyncMutex::new(VecDeque::new());
         let pending_len = AtomicUsize::new(0);
         let mut writer = MockWriter {
             vectored: true,
@@ -606,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_compact_driver_flushes_small_frames_once() {
-        let pending = std::sync::Mutex::new(VecDeque::from([
+        let pending = SyncMutex::new(VecDeque::from([
             pending_compact_frame(1024, true),
             pending_compact_frame(1024, true),
         ]));
