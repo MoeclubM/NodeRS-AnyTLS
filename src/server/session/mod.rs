@@ -679,7 +679,10 @@ async fn handle_tcp_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::channel::{ChannelReader, InboundMessage, PayloadPool, test_chunk};
+    use super::channel::{
+        ChannelReader, InboundMessage, PayloadBuffer, PayloadPool, bounded_inbound_channel,
+        test_chunk,
+    };
     use super::frame::{
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
@@ -1102,6 +1105,74 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(front_offset, 2);
         assert_eq!(chunks.front().expect("remaining chunk").bytes(), b"world");
+    }
+
+    #[tokio::test]
+    async fn advance_chunk_batch_releases_consumed_chunk_budget() {
+        let (sender, mut rx) = bounded_inbound_channel(8, 8);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 4]))
+            .expect("send first chunk");
+        sender
+            .try_send_data(PayloadBuffer::new(vec![2; 4]))
+            .expect("send second chunk");
+
+        let first = match rx.recv().await.expect("receive first chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let second = match rx.recv().await.expect("receive second chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let mut chunks = std::collections::VecDeque::from([first, second]);
+        let mut front_offset = 0usize;
+
+        advance_chunk_batch(&mut chunks, &mut front_offset, 4);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(front_offset, 0);
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![3; 4])).is_ok(),
+            "released chunk budget should be reusable immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_chunk_batch_keeps_partial_chunk_budget_reserved() {
+        let (sender, mut rx) = bounded_inbound_channel(8, 8);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 4]))
+            .expect("send first chunk");
+        sender
+            .try_send_data(PayloadBuffer::new(vec![2; 4]))
+            .expect("send second chunk");
+
+        let first = match rx.recv().await.expect("receive first chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let second = match rx.recv().await.expect("receive second chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let mut chunks = std::collections::VecDeque::from([first, second]);
+        let mut front_offset = 0usize;
+
+        advance_chunk_batch(&mut chunks, &mut front_offset, 5);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(front_offset, 1);
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![3; 4])).is_ok(),
+            "only the fully consumed chunk budget should have been released"
+        );
+        assert!(
+            sender
+                .try_send_data(PayloadBuffer::new(vec![4; 1]))
+                .is_err(),
+            "the partially consumed chunk budget must stay reserved"
+        );
     }
 
     #[test]

@@ -128,6 +128,11 @@ pub(super) struct BufferedChunk {
     permit: ByteBudgetPermit,
 }
 
+pub(super) struct BudgetReleaseBatch {
+    budget: Option<Arc<ByteBudget>>,
+    len: usize,
+}
+
 impl BufferedChunk {
     fn new(payload: PayloadBuffer, permit: ByteBudgetPermit) -> Self {
         Self { payload, permit }
@@ -151,6 +156,30 @@ impl BufferedChunk {
         Self {
             payload: PayloadBuffer::new(bytes),
             permit: self.permit,
+        }
+    }
+
+    pub(super) fn add_budget_release(&mut self, batch: &mut BudgetReleaseBatch) {
+        if let Some((budget, len)) = self.permit.take_release() {
+            if batch.budget.is_none() {
+                batch.budget = Some(budget);
+            }
+            batch.len += len;
+        }
+    }
+}
+
+impl BudgetReleaseBatch {
+    pub(super) fn new() -> Self {
+        Self {
+            budget: None,
+            len: 0,
+        }
+    }
+
+    pub(super) fn flush(self) {
+        if let Some(budget) = self.budget {
+            budget.release(self.len);
         }
     }
 }
@@ -350,7 +379,7 @@ impl ByteBudget {
         }
     }
 
-    fn release(&self, len: usize) {
+    pub(super) fn release(&self, len: usize) {
         if len == 0 {
             return;
         }
@@ -405,6 +434,13 @@ struct ByteBudgetPermit {
 impl ByteBudgetPermit {
     fn new(budget: Arc<ByteBudget>, len: usize) -> Self {
         Self { budget, len }
+    }
+
+    fn take_release(&mut self) -> Option<(Arc<ByteBudget>, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        Some((self.budget.clone(), std::mem::take(&mut self.len)))
     }
 }
 
