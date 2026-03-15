@@ -1244,6 +1244,21 @@ mod tests {
         assert_eq!(writer.vectored_writes, 1);
     }
 
+    #[cfg(target_env = "musl")]
+    #[tokio::test]
+    async fn tiny_multi_chunk_upload_batch_uses_inline_scalar_write_on_musl() {
+        let chunks = std::collections::VecDeque::from([test_chunk(b"he"), test_chunk(b"llo")]);
+        let mut writer = WriteModeRecorder::default();
+
+        let written = write_chunk_batch_for_test(&mut writer, &chunks, 0, upload_batch_policy(5))
+            .await
+            .expect("write tiny multi chunk batch");
+
+        assert_eq!(written, 5);
+        assert_eq!(writer.scalar_writes, 1);
+        assert_eq!(writer.vectored_writes, 0);
+    }
+
     #[tokio::test]
     async fn large_single_chunk_upload_batch_keeps_vectored_write_path() {
         let payload = vec![7u8; 32 * 1024];

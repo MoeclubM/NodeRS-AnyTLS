@@ -23,6 +23,8 @@ use super::writer::{FrameWriter, write_frame};
 
 #[cfg(target_env = "musl")]
 const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
+#[cfg(target_env = "musl")]
+const INLINE_MUSL_UPLOAD_BATCH_BYTES: usize = 2 * SMALL_PAYLOAD_LEN;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
@@ -225,18 +227,29 @@ where
     }
     if writer.is_write_vectored() {
         #[cfg(target_env = "musl")]
-        if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
-            && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS
-        {
-            // Musl benefits from keeping tiny small-upload batches off the 96-slot IoSlice
-            // staging path while still using write_vectored for single-chunk uploads.
-            return write_chunk_batch_vectored::<_, TINY_UPLOAD_BATCH_IOVECS>(
-                writer,
-                chunks,
-                front_offset,
-                policy,
-            )
-            .await;
+        if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS {
+            if chunks.len() > 1 && chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
+                let mut buffer = [0u8; INLINE_MUSL_UPLOAD_BATCH_BYTES];
+                if let Some(total) =
+                    fill_chunk_batch_inline(chunks, front_offset, &mut buffer, policy)
+                {
+                    return writer
+                        .write(&buffer[..total])
+                        .await
+                        .context("write inbound chunk batch");
+                }
+            }
+            if chunks.len() <= TINY_UPLOAD_BATCH_IOVECS {
+                // Musl benefits from keeping tiny small-upload batches off the 80-slot IoSlice
+                // staging path while still using write_vectored for single-chunk uploads.
+                return write_chunk_batch_vectored::<_, TINY_UPLOAD_BATCH_IOVECS>(
+                    writer,
+                    chunks,
+                    front_offset,
+                    policy,
+                )
+                .await;
+            }
         }
         match policy.max_iovecs {
             SMALL_UPLOAD_BATCH_IOVECS => {
@@ -285,6 +298,38 @@ where
         .write(&front.bytes()[front_offset..])
         .await
         .context("write inbound chunk")
+}
+
+#[cfg(target_env = "musl")]
+fn fill_chunk_batch_inline(
+    chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
+    buffer: &mut [u8],
+    policy: super::frame::UploadBatchPolicy,
+) -> Option<usize> {
+    let mut total = 0usize;
+    let mut remaining = policy.max_bytes;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if index >= policy.max_iovecs || remaining == 0 {
+            break;
+        }
+        let slice = if index == 0 {
+            &chunk.bytes()[front_offset..]
+        } else {
+            chunk.bytes()
+        };
+        if slice.is_empty() {
+            continue;
+        }
+        let used = slice.len().min(remaining);
+        if total + used > buffer.len() {
+            return None;
+        }
+        buffer[total..total + used].copy_from_slice(&slice[..used]);
+        total += used;
+        remaining -= used;
+    }
+    Some(total)
 }
 
 async fn write_chunk_batch_vectored<W, const N: usize>(
