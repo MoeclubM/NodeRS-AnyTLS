@@ -22,6 +22,12 @@ enum CompactContentionStrategy {
     Queue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDrain {
+    None,
+    Drained { needs_flush: bool },
+}
+
 struct PendingCompactFrame {
     buffer: Box<[u8]>,
     needs_flush: bool,
@@ -35,6 +41,7 @@ pub(super) struct FrameWriter {
     // Large writes frequently touch this path when no compact frames are queued.
     // Tracking the queue length atomically avoids taking the mutex in that case.
     pending_compact_len: Arc<AtomicUsize>,
+    pending_compact_driver: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FrameWriter {
@@ -43,6 +50,7 @@ impl FrameWriter {
             inner: Arc::new(Mutex::new(writer)),
             pending_compact: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             pending_compact_len: Arc::new(AtomicUsize::new(0)),
+            pending_compact_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -90,10 +98,27 @@ impl FrameWriter {
             },
         )?;
 
-        let mut writer = self.inner.lock().await;
-        self.flush_after_write(&mut *writer, cmd, payload.len())
-            .await?;
-        drop(writer);
+        if claim_pending_compact_driver(&self.pending_compact_driver) {
+            let drive_result = async {
+                let mut writer = self.inner.lock().await;
+                drive_pending_compact_frames(
+                    &self.pending_compact,
+                    &self.pending_compact_len,
+                    &self.pending_compact_driver,
+                    &mut *writer,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = drive_result {
+                fail_pending_compact_frames(
+                    &self.pending_compact,
+                    &self.pending_compact_len,
+                    &error,
+                );
+                return Err(error);
+            }
+        }
         done_rx.await.context("await compact frame completion")??;
         Ok(())
     }
@@ -107,12 +132,16 @@ impl FrameWriter {
     where
         W: AsyncWrite + Unpin,
     {
-        let pending_needs_flush = drain_pending_compact_frames_if_any(
+        let pending_needs_flush = match drain_pending_compact_frames_if_any(
             &self.pending_compact,
             &self.pending_compact_len,
             writer,
         )
-        .await?;
+        .await?
+        {
+            PendingDrain::None => false,
+            PendingDrain::Drained { needs_flush } => needs_flush,
+        };
         if should_flush_frame(cmd, payload_len) || pending_needs_flush {
             writer.flush().await.context("flush session frame")?;
         }
@@ -162,16 +191,22 @@ fn enqueue_pending_compact_frame(
     Ok(())
 }
 
+fn claim_pending_compact_driver(driver: &std::sync::atomic::AtomicBool) -> bool {
+    driver
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 async fn drain_pending_compact_frames_if_any<W>(
     pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     writer: &mut W,
-) -> anyhow::Result<bool>
+) -> anyhow::Result<PendingDrain>
 where
     W: AsyncWrite + Unpin,
 {
     if pending_len.load(Ordering::Acquire) == 0 {
-        return Ok(false);
+        return Ok(PendingDrain::None);
     }
     drain_pending_compact_frames(pending, pending_len, writer).await
 }
@@ -180,7 +215,7 @@ async fn drain_pending_compact_frames<W>(
     pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
     pending_len: &AtomicUsize,
     writer: &mut W,
-) -> anyhow::Result<bool>
+) -> anyhow::Result<PendingDrain>
 where
     W: AsyncWrite + Unpin,
 {
@@ -189,7 +224,7 @@ where
         guard.drain(..).collect::<Vec<_>>()
     };
     if frames.is_empty() {
-        return Ok(false);
+        return Ok(PendingDrain::None);
     }
     pending_len.fetch_sub(frames.len(), Ordering::AcqRel);
     let needs_flush = frames.iter().any(|frame| frame.needs_flush);
@@ -208,7 +243,61 @@ where
             return Err(error);
         }
     }
-    Ok(needs_flush)
+    Ok(PendingDrain::Drained { needs_flush })
+}
+
+async fn drive_pending_compact_frames<W>(
+    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending_len: &AtomicUsize,
+    driver: &std::sync::atomic::AtomicBool,
+    writer: &mut W,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut should_flush = false;
+    loop {
+        match drain_pending_compact_frames_if_any(pending, pending_len, writer).await? {
+            PendingDrain::None => {
+                driver.store(false, Ordering::Release);
+                if pending_len.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                if !claim_pending_compact_driver(driver) {
+                    break;
+                }
+            }
+            PendingDrain::Drained { needs_flush } => {
+                should_flush |= needs_flush;
+            }
+        }
+    }
+    if should_flush {
+        writer
+            .flush()
+            .await
+            .context("flush pending compact frames")?;
+    }
+    Ok(())
+}
+
+fn fail_pending_compact_frames(
+    pending: &std::sync::Mutex<VecDeque<PendingCompactFrame>>,
+    pending_len: &AtomicUsize,
+    error: &anyhow::Error,
+) {
+    let frames = {
+        let mut guard = pending.lock().expect("pending compact queue poisoned");
+        guard.drain(..).collect::<Vec<_>>()
+    };
+    if frames.is_empty() {
+        return;
+    }
+    pending_len.fetch_sub(frames.len(), Ordering::AcqRel);
+    let message = error.to_string();
+    for frame in frames {
+        let _ = frame.done.send(Err(anyhow::anyhow!(message.clone())));
+    }
 }
 
 async fn write_compact_frame<W>(
@@ -472,7 +561,7 @@ mod tests {
         let needs_flush = drain_pending_compact_frames(&pending, &pending_len, &mut writer)
             .await
             .expect("drain pending frames");
-        assert!(!needs_flush);
+        assert_eq!(needs_flush, PendingDrain::Drained { needs_flush: false });
         assert_eq!(writer.flushes, 0);
         assert_eq!(writer.bytes.len(), 6 * 1024);
         assert_eq!(writer.write_vectored_calls, 1);
@@ -491,7 +580,7 @@ mod tests {
         let needs_flush = drain_pending_compact_frames(&pending, &pending_len, &mut writer)
             .await
             .expect("drain pending frames");
-        assert!(needs_flush);
+        assert_eq!(needs_flush, PendingDrain::Drained { needs_flush: true });
         assert_eq!(writer.flushes, 0);
         assert_eq!(writer.bytes.len(), 1024);
         assert_eq!(writer.write_vectored_calls, 1);
@@ -510,9 +599,40 @@ mod tests {
         let needs_flush = drain_pending_compact_frames_if_any(&pending, &pending_len, &mut writer)
             .await
             .expect("skip empty pending drain");
-        assert!(!needs_flush);
+        assert_eq!(needs_flush, PendingDrain::None);
         assert_eq!(writer.bytes.len(), 0);
         assert_eq!(writer.write_vectored_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn pending_compact_driver_flushes_small_frames_once() {
+        let pending = std::sync::Mutex::new(VecDeque::from([
+            pending_compact_frame(1024, true),
+            pending_compact_frame(1024, true),
+        ]));
+        let pending_len = AtomicUsize::new(2);
+        let driver = std::sync::atomic::AtomicBool::new(true);
+        let mut writer = MockWriter {
+            vectored: true,
+            ..Default::default()
+        };
+
+        drive_pending_compact_frames(&pending, &pending_len, &driver, &mut writer)
+            .await
+            .expect("drive pending frames");
+        assert_eq!(writer.flushes, 1);
+        assert_eq!(writer.bytes.len(), 2 * 1024);
+        assert_eq!(pending_len.load(Ordering::Acquire), 0);
+        assert!(!driver.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn pending_compact_driver_is_claimed_once() {
+        let driver = std::sync::atomic::AtomicBool::new(false);
+        assert!(claim_pending_compact_driver(&driver));
+        assert!(!claim_pending_compact_driver(&driver));
+        driver.store(false, Ordering::Release);
+        assert!(claim_pending_compact_driver(&driver));
     }
 
     #[tokio::test]
