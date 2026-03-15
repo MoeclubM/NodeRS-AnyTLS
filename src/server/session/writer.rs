@@ -82,6 +82,38 @@ impl FrameWriter {
         self.flush_after_write(&mut *writer, cmd, payload_len).await
     }
 
+    #[cfg(target_env = "musl")]
+    async fn send_prefixed(
+        &self,
+        cmd: u8,
+        stream_id: u32,
+        buffer: &mut [u8],
+        payload_len: usize,
+    ) -> anyhow::Result<()> {
+        if payload_len > MAX_FRAME_PAYLOAD_LEN {
+            bail!("payload too large: {}", payload_len);
+        }
+        ensure!(
+            payload_len > COMPACT_FRAME_PAYLOAD_THRESHOLD,
+            "prefixed frame path reserved for large payloads"
+        );
+        ensure!(
+            buffer.len() >= 7 + payload_len,
+            "prefixed frame buffer too small: {} < {}",
+            buffer.len(),
+            7 + payload_len
+        );
+        let header = build_frame_header(cmd, stream_id, payload_len);
+        buffer[..7].copy_from_slice(&header);
+
+        let mut writer = self.inner.lock().await;
+        writer
+            .write_all(&buffer[..7 + payload_len])
+            .await
+            .context("write prefixed session frame")?;
+        self.flush_after_write(&mut *writer, cmd, payload_len).await
+    }
+
     async fn enqueue_compact_frame(
         &self,
         header: &[u8; 7],
@@ -157,6 +189,19 @@ pub(super) async fn write_frame(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     writer.send(cmd, stream_id, payload).await
+}
+
+#[cfg(target_env = "musl")]
+pub(super) async fn write_prefixed_frame(
+    writer: &FrameWriter,
+    cmd: u8,
+    stream_id: u32,
+    buffer: &mut [u8],
+    payload_len: usize,
+) -> anyhow::Result<()> {
+    writer
+        .send_prefixed(cmd, stream_id, buffer, payload_len)
+        .await
 }
 
 fn build_frame_header(cmd: u8, stream_id: u32, payload_len: usize) -> [u8; 7] {
