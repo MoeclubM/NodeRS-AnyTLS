@@ -22,7 +22,7 @@ use super::frame::{
 use super::writer::{FrameWriter, write_frame};
 
 #[cfg(target_env = "musl")]
-const TINY_UPLOAD_BATCH_IOVECS: usize = 4;
+const TINY_UPLOAD_BATCH_IOVECS: usize = 8;
 
 pub(super) async fn pump_inbound_to_remote<W>(
     mut pending: Option<BufferedChunk>,
