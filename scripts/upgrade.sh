@@ -6,6 +6,9 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 COMMON_LIB_PATH="$SCRIPT_DIR/lib/install-common.sh"
 PREFIX="/usr/local"
 CONFIG_DIR="/etc/noders/anytls"
+STATE_DIR="/var/lib/noders/anytls"
+RUN_DIR="/run/noders-anytls"
+LOG_DIR="/var/log/noders-anytls"
 SERVICE_NAME="noders-anytls"
 VERSION="latest"
 NO_RESTART=0
@@ -13,6 +16,8 @@ TMP_ROOT=""
 BACKUP_BINARY=""
 RESTART_STATE="pending"
 SERVICE_MANAGER="none"
+OPENRC_SERVICE_USER="noders-anytls"
+OPENRC_SERVICE_GROUP="noders-anytls"
 declare -a DISCOVERED_UNITS=()
 declare -a ACTIVE_UNITS=()
 declare -a RESTARTED_UNITS=()
@@ -297,6 +302,38 @@ restore_previous_binary() {
   install -m 0755 "$BACKUP_BINARY" "$PREFIX/bin/noders-anytls"
 }
 
+discover_openrc_service_account() {
+  OPENRC_SERVICE_USER="noders-anytls"
+  OPENRC_SERVICE_GROUP="noders-anytls"
+
+  local unit_path command_user
+  shopt -s nullglob
+  for unit_path in /etc/init.d/${SERVICE_NAME} /etc/init.d/${SERVICE_NAME}-*; do
+    [[ -f "$unit_path" ]] || continue
+    command_user="$(sed -n 's/^command_user="\([^"]*\)"$/\1/p' "$unit_path" | head -n1)"
+    if [[ -n "$command_user" ]]; then
+      IFS=':' read -r OPENRC_SERVICE_USER OPENRC_SERVICE_GROUP <<<"$command_user"
+      [[ -n "$OPENRC_SERVICE_USER" ]] || OPENRC_SERVICE_USER="noders-anytls"
+      [[ -n "$OPENRC_SERVICE_GROUP" ]] || OPENRC_SERVICE_GROUP="$OPENRC_SERVICE_USER"
+      break
+    fi
+  done
+  shopt -u nullglob
+}
+
+repair_openrc_permissions() {
+  [[ "$SERVICE_MANAGER" == "openrc" ]] || return 0
+  [[ "$(id -u)" -eq 0 ]] || return 0
+
+  discover_openrc_service_account
+
+  local path
+  for path in "$STATE_DIR" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR"; do
+    [[ -e "$path" ]] || continue
+    chown -R "$OPENRC_SERVICE_USER":"$OPENRC_SERVICE_GROUP" "$path"
+  done
+}
+
 install_from_bundle() {
   local staging_dir
   staging_dir="$1"
@@ -416,6 +453,7 @@ main() {
 
   ensure_existing_installation
   discover_units
+  repair_openrc_permissions
   discover_active_units
   backup_current_binary
   install_from_bundle "$SCRIPT_DIR"
