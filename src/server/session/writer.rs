@@ -113,16 +113,18 @@ impl FrameWriter {
                 .context("write prefixed session frame")?;
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
-        // Under musl the large-download hot path loses most in mutex handoff cost, not in the
-        // frame write itself. Yield once before joining the waiter queue so the current holder
-        // can finish and the next large prefixed frame can often grab the lock outright.
-        tokio::task::yield_now().await;
-        if let Ok(mut writer) = self.inner.try_lock() {
-            writer
-                .write_all(&buffer[..7 + payload_len])
-                .await
-                .context("write prefixed session frame")?;
-            return self.flush_after_write(&mut *writer, cmd, payload_len).await;
+        if payload_len >= 32 * 1024 {
+            // Under musl the 32 KiB-class download path loses most in mutex handoff cost, not in
+            // the frame write itself. Yield once before joining the waiter queue so the current
+            // holder can finish and the next large prefixed frame can often grab the lock outright.
+            tokio::task::yield_now().await;
+            if let Ok(mut writer) = self.inner.try_lock() {
+                writer
+                    .write_all(&buffer[..7 + payload_len])
+                    .await
+                    .context("write prefixed session frame")?;
+                return self.flush_after_write(&mut *writer, cmd, payload_len).await;
+            }
         }
         let mut writer = self.inner.lock().await;
         writer
