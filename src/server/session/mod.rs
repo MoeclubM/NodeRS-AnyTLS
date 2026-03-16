@@ -687,6 +687,8 @@ mod tests {
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
         parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
+    #[cfg(target_env = "musl")]
+    use super::io::pump_inbound_to_remote;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         pump_copy, write_chunk_batch_for_test,
@@ -1270,6 +1272,37 @@ mod tests {
             .expect("write tiny multi chunk batch");
 
         assert_eq!(written, 5);
+        assert_eq!(writer.scalar_writes, 1);
+        assert_eq!(writer.vectored_writes, 0);
+    }
+
+    #[cfg(target_env = "musl")]
+    #[tokio::test]
+    async fn musl_small_upload_batch_retries_after_one_scheduler_yield() {
+        let (tx, rx) = mpsc::channel(8);
+        let control = SessionControl::new();
+        let mut writer = WriteModeRecorder::default();
+
+        let sender = tokio::spawn(async move {
+            tx.send(InboundMessage::Data(test_chunk(b"world")))
+                .await
+                .expect("send second chunk");
+            tx.send(InboundMessage::Fin).await.expect("send fin");
+        });
+
+        let transferred = pump_inbound_to_remote(
+            Some(test_chunk(b"hello")),
+            rx,
+            false,
+            &mut writer,
+            control,
+            None,
+        )
+        .await
+        .expect("pump inbound");
+
+        sender.await.expect("join sender");
+        assert_eq!(transferred, 10);
         assert_eq!(writer.scalar_writes, 1);
         assert_eq!(writer.vectored_writes, 0);
     }

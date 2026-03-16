@@ -56,30 +56,33 @@ where
             front_offset = 0;
         }
         let policy = upload_batch_policy_for_chunks(&chunks);
-        while queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !finished {
-            match rx.try_recv() {
-                Ok(InboundMessage::Data(chunk)) => {
-                    if chunks.is_empty()
-                        || (queued_bytes + chunk.len() <= policy.max_bytes
-                            && chunks.len() < policy.max_iovecs)
-                    {
-                        queued_bytes += chunk.len();
-                        chunks.push_back(chunk);
-                    } else {
-                        pending = Some(chunk);
-                        break;
-                    }
-                }
-                Ok(InboundMessage::Fin) => {
-                    finished = true;
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    finished = true;
-                    break;
-                }
-            }
+        fill_ready_upload_batch(
+            &mut rx,
+            &mut chunks,
+            &mut pending,
+            &mut queued_bytes,
+            &mut finished,
+            policy,
+        );
+        #[cfg(target_env = "musl")]
+        if !finished
+            && pending.is_none()
+            && chunks.len() == 1
+            && queued_bytes <= SMALL_PAYLOAD_LEN
+            && policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS
+        {
+            // Musl remains weakest on tiny concurrent uploads. Yield once when only a single
+            // 1 KiB-class chunk is ready so the immediately-following chunk can join the same
+            // inline batch without turning this into a blocking wait loop.
+            tokio::task::yield_now().await;
+            fill_ready_upload_batch(
+                &mut rx,
+                &mut chunks,
+                &mut pending,
+                &mut queued_bytes,
+                &mut finished,
+                policy,
+            );
         }
         if chunks.is_empty() {
             if finished {
@@ -115,6 +118,41 @@ where
         if finished && pending.is_none() && chunks.is_empty() {
             let _ = writer.shutdown().await;
             return Ok(total);
+        }
+    }
+}
+
+fn fill_ready_upload_batch(
+    rx: &mut mpsc::Receiver<InboundMessage>,
+    chunks: &mut VecDeque<BufferedChunk>,
+    pending: &mut Option<BufferedChunk>,
+    queued_bytes: &mut usize,
+    finished: &mut bool,
+    policy: super::frame::UploadBatchPolicy,
+) {
+    while *queued_bytes < policy.max_bytes && chunks.len() < policy.max_iovecs && !*finished {
+        match rx.try_recv() {
+            Ok(InboundMessage::Data(chunk)) => {
+                if chunks.is_empty()
+                    || (*queued_bytes + chunk.len() <= policy.max_bytes
+                        && chunks.len() < policy.max_iovecs)
+                {
+                    *queued_bytes += chunk.len();
+                    chunks.push_back(chunk);
+                } else {
+                    *pending = Some(chunk);
+                    break;
+                }
+            }
+            Ok(InboundMessage::Fin) => {
+                *finished = true;
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                *finished = true;
+                break;
+            }
         }
     }
 }
