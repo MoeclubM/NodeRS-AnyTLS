@@ -1148,6 +1148,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advance_chunk_batch_releases_multiple_consumed_chunk_budgets() {
+        let (sender, mut rx) = bounded_inbound_channel(8, 8);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1; 4]))
+            .expect("send first chunk");
+        sender
+            .try_send_data(PayloadBuffer::new(vec![2; 4]))
+            .expect("send second chunk");
+
+        let first = match rx.recv().await.expect("receive first chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let second = match rx.recv().await.expect("receive second chunk") {
+            InboundMessage::Data(chunk) => chunk,
+            InboundMessage::Fin => panic!("unexpected fin"),
+        };
+        let mut chunks = std::collections::VecDeque::from([first, second]);
+        let mut front_offset = 0usize;
+
+        advance_chunk_batch(&mut chunks, &mut front_offset, 8);
+
+        assert!(chunks.is_empty());
+        assert_eq!(front_offset, 0);
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![3; 4])).is_ok(),
+            "first released chunk budget should be reusable immediately"
+        );
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![4; 4])).is_ok(),
+            "all consumed chunk budget should be reusable after a batched release"
+        );
+    }
+
+    #[tokio::test]
     async fn advance_chunk_batch_keeps_partial_chunk_budget_reserved() {
         let (sender, mut rx) = bounded_inbound_channel(8, 8);
         sender

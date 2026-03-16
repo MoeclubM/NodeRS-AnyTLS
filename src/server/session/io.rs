@@ -12,7 +12,7 @@ use crate::accounting::SessionControl;
 
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
-use super::channel::{BufferedChunk, InboundMessage};
+use super::channel::{BudgetReleaseBatch, BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
 use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::frame::{
@@ -547,6 +547,7 @@ pub(super) fn advance_chunk_batch(
     front_offset: &mut usize,
     mut written: usize,
 ) {
+    let mut release_batch = BudgetReleaseBatch::new();
     while written > 0 {
         let Some(front) = chunks.front() else {
             *front_offset = 0;
@@ -558,7 +559,10 @@ pub(super) fn advance_chunk_batch(
             break;
         }
         written -= remaining;
-        chunks.pop_front();
+        if let Some(mut consumed) = chunks.pop_front() {
+            consumed.add_budget_release(&mut release_batch);
+        }
         *front_offset = 0;
     }
+    release_batch.flush();
 }
