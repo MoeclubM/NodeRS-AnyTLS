@@ -23,6 +23,8 @@ pub(super) const SMALL_DOWNLOAD_COALESCE_WAIT: std::time::Duration =
     std::time::Duration::from_millis(2);
 #[cfg(target_env = "musl")]
 pub(super) const MUSL_LARGE_DOWNLOAD_COALESCE_SPAN: usize = 24 * 1024;
+#[cfg(target_env = "musl")]
+pub(super) const MUSL_PREFIXED_FRAME_THRESHOLD: usize = 56 * 1024;
 pub(super) const SMALL_UPLOAD_BATCH_SIZE: usize = 96 * 1024;
 pub(super) const LARGE_UPLOAD_BATCH_SIZE: usize = 192 * 1024;
 pub(super) const DEFAULT_UPLOAD_BATCH_SIZE: usize = 128 * 1024;
