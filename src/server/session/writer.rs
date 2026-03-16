@@ -8,8 +8,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
-#[cfg(target_env = "musl")]
-use super::frame::MEDIUM_PAYLOAD_LEN;
 use super::frame::{
     CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, SMALL_PAYLOAD_LEN,
     should_flush_frame,
@@ -115,7 +113,7 @@ impl FrameWriter {
                 .context("write prefixed session frame")?;
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
-        if payload_len >= MEDIUM_PAYLOAD_LEN {
+        if payload_len >= 32 * 1024 {
             return self
                 .enqueue_pending_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice(), false)
                 .await;
