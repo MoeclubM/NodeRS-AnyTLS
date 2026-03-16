@@ -249,8 +249,26 @@ impl FrameWriter {
             PendingDrain::None => false,
             PendingDrain::Drained { needs_flush } => needs_flush,
         };
+        #[cfg(target_env = "musl")]
+        let pending_prefixed_needs_flush = match drain_pending_compact_frames_if_any(
+            &self.pending_prefixed,
+            &self.pending_prefixed_len,
+            writer,
+        )
+        .await?
+        {
+            PendingDrain::None => false,
+            PendingDrain::Drained { needs_flush } => needs_flush,
+        };
+        #[cfg(not(target_env = "musl"))]
+        let pending_prefixed_needs_flush = false;
         if should_flush_frame(cmd, payload_len) || pending_needs_flush {
             writer.flush().await.context("flush session frame")?;
+        } else if pending_prefixed_needs_flush {
+            writer
+                .flush()
+                .await
+                .context("flush prefixed session frame")?;
         }
         Ok(())
     }
