@@ -14,15 +14,13 @@ use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
-use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
+use super::frame::SMALL_DOWNLOAD_COALESCE_TARGET;
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
     MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
     SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
     download_coalesce_target, upload_batch_policy,
 };
-#[cfg(target_env = "musl")]
-use super::writer::write_prefixed_frame;
 use super::writer::{FrameWriter, write_frame};
 
 #[cfg(target_env = "musl")]
@@ -171,7 +169,7 @@ pub(super) async fn pump_remote_to_client<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut buffer = vec![0u8; 7 + MAX_FRAME_PAYLOAD_LEN];
+    let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
     loop {
         if control.is_cancelled() {
@@ -179,24 +177,17 @@ where
         }
         let read = tokio::select! {
             _ = control.cancelled() => return Ok(total),
-            read = reader.read(&mut buffer[7..]) => read?,
+            read = reader.read(&mut buffer) => read?,
         };
         if read == 0 {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
         let (read, saw_eof) = match download_coalesce_target(read) {
-            Some(target) => coalesce_download_reads(reader, &mut buffer[7..], read, target).await?,
+            Some(target) => coalesce_download_reads(reader, &mut buffer, read, target).await?,
             None => (read, false),
         };
-        #[cfg(target_env = "musl")]
-        if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
-            write_prefixed_frame(&writer, CMD_PSH, stream_id, &mut buffer, read).await?;
-        } else {
-            write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
-        }
-        #[cfg(not(target_env = "musl"))]
-        write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
+        write_frame(&writer, CMD_PSH, stream_id, &buffer[..read]).await?;
         let transferred = read as u64;
         total += transferred;
         if let Some(traffic) = traffic.as_ref() {
@@ -408,7 +399,9 @@ where
             Some(read) => {
                 filled += read;
                 retried_after_yield = false;
-                if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+                if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD
+                    && !keep_coalescing_large_immediate_reads(target, filled)
+                {
                     break;
                 }
             }
@@ -438,7 +431,9 @@ where
                     Some(read) => {
                         filled += read;
                         retried_after_yield = false;
-                        if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+                        if read >= SMALL_DATA_FRAME_FLUSH_THRESHOLD
+                            && !keep_coalescing_large_immediate_reads(target, filled)
+                        {
                             break;
                         }
                     }
@@ -449,6 +444,18 @@ where
         }
     }
     Ok((filled, saw_eof))
+}
+
+fn keep_coalescing_large_immediate_reads(target: usize, filled: usize) -> bool {
+    #[cfg(target_env = "musl")]
+    {
+        target > SMALL_DOWNLOAD_COALESCE_TARGET && filled < target
+    }
+    #[cfg(not(target_env = "musl"))]
+    {
+        let _ = (target, filled);
+        false
+    }
 }
 
 async fn try_read_available<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<Option<usize>>

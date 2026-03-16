@@ -1069,6 +1069,34 @@ mod tests {
         assert!(buffer[32 * 1024..56 * 1024].iter().all(|byte| *byte == 2));
     }
 
+    #[cfg(target_env = "musl")]
+    #[tokio::test]
+    async fn musl_large_download_coalescing_consumes_multiple_immediate_segments() {
+        let mut reader = SegmentedReader::new([
+            vec![1u8; 32 * 1024],
+            vec![2u8; 16 * 1024],
+            vec![3u8; 8 * 1024],
+        ]);
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..32 * 1024])
+            .await
+            .expect("read first large chunk");
+        assert_eq!(first, 32 * 1024);
+
+        let target = download_coalesce_target(first).expect("large reads should coalesce");
+        let (filled, saw_eof) = coalesce_download_reads(&mut reader, &mut buffer, first, target)
+            .await
+            .expect("coalesce multiple immediate large reads");
+
+        assert_eq!(filled, 56 * 1024);
+        assert!(!saw_eof);
+        assert!(buffer[..32 * 1024].iter().all(|byte| *byte == 1));
+        assert!(buffer[32 * 1024..48 * 1024].iter().all(|byte| *byte == 2));
+        assert!(buffer[48 * 1024..56 * 1024].iter().all(|byte| *byte == 3));
+    }
+
     #[tokio::test]
     async fn coalescing_download_reads_does_not_wait_when_no_more_data_arrives() {
         let mut reader = SegmentedReader::new([vec![7u8; 1024]]);
