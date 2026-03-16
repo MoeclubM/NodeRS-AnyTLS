@@ -14,7 +14,7 @@ use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
-use super::frame::MUSL_PREFIXED_FRAME_THRESHOLD;
+use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
     MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
@@ -229,7 +229,7 @@ where
             None => (read, false),
         };
         #[cfg(target_env = "musl")]
-        if read > MUSL_PREFIXED_FRAME_THRESHOLD {
+        if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
             write_prefixed_frame(&writer, CMD_PSH, stream_id, &mut buffer, read).await?;
         } else {
             write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
