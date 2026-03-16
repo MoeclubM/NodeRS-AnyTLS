@@ -8,8 +8,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::sync::{Mutex, oneshot};
 
 use super::TlsStream;
-#[cfg(target_env = "musl")]
-use super::frame::MEDIUM_PAYLOAD_LEN;
 use super::frame::{
     CMD_PSH, COMPACT_FRAME_PAYLOAD_THRESHOLD, MAX_FRAME_PAYLOAD_LEN, SMALL_PAYLOAD_LEN,
     should_flush_frame,
@@ -45,6 +43,12 @@ pub(super) struct FrameWriter {
     // Tracking the queue length atomically avoids taking the mutex in that case.
     pending_compact_len: Arc<AtomicUsize>,
     pending_compact_driver: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed: Arc<SyncMutex<VecDeque<PendingCompactFrame>>>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed_len: Arc<AtomicUsize>,
+    #[cfg(target_env = "musl")]
+    pending_prefixed_driver: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FrameWriter {
@@ -54,6 +58,12 @@ impl FrameWriter {
             pending_compact: Arc::new(SyncMutex::new(VecDeque::new())),
             pending_compact_len: Arc::new(AtomicUsize::new(0)),
             pending_compact_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(target_env = "musl")]
+            pending_prefixed: Arc::new(SyncMutex::new(VecDeque::new())),
+            #[cfg(target_env = "musl")]
+            pending_prefixed_len: Arc::new(AtomicUsize::new(0)),
+            #[cfg(target_env = "musl")]
+            pending_prefixed_driver: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -115,9 +125,9 @@ impl FrameWriter {
                 .context("write prefixed session frame")?;
             return self.flush_after_write(&mut *writer, cmd, payload_len).await;
         }
-        if payload_len >= MEDIUM_PAYLOAD_LEN {
+        if payload_len >= 32 * 1024 {
             return self
-                .enqueue_pending_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice(), false)
+                .enqueue_prefixed_frame(buffer[..7 + payload_len].to_vec().into_boxed_slice())
                 .await;
         }
         let mut writer = self.inner.lock().await;
@@ -179,6 +189,44 @@ impl FrameWriter {
             }
         }
         done_rx.await.context("await compact frame completion")??;
+        Ok(())
+    }
+
+    #[cfg(target_env = "musl")]
+    async fn enqueue_prefixed_frame(&self, buffer: Box<[u8]>) -> anyhow::Result<()> {
+        let (done_tx, done_rx) = oneshot::channel();
+        enqueue_pending_compact_frame(
+            &self.pending_prefixed,
+            &self.pending_prefixed_len,
+            PendingCompactFrame {
+                buffer,
+                needs_flush: false,
+                done: done_tx,
+            },
+        )?;
+
+        if claim_pending_compact_driver(&self.pending_prefixed_driver) {
+            let drive_result = async {
+                let mut writer = self.inner.lock().await;
+                drive_pending_compact_frames(
+                    &self.pending_prefixed,
+                    &self.pending_prefixed_len,
+                    &self.pending_prefixed_driver,
+                    &mut *writer,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = drive_result {
+                fail_pending_compact_frames(
+                    &self.pending_prefixed,
+                    &self.pending_prefixed_len,
+                    &error,
+                );
+                return Err(error);
+            }
+        }
+        done_rx.await.context("await prefixed frame completion")??;
         Ok(())
     }
 
