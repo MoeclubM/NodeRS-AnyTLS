@@ -31,8 +31,8 @@ use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    LARGE_INBOUND_SEGMENT_LEN, MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES,
-    STREAM_INBOUND_QUEUE_CAPACITY, inbound_segment_len, is_eof, padding_md5, parse_settings,
+    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY,
+    inbound_forward_segment_len, is_eof, padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
@@ -226,25 +226,34 @@ impl Session {
     }
 
     async fn handle_psh(&mut self, header: FrameHeader) -> anyhow::Result<()> {
-        let mut payload = self.payload_pool.take(header.length as usize);
-        read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
-
         let inbound = {
             let streams = self.state.streams.read().expect("streams lock poisoned");
             streams
                 .get(&header.stream_id)
                 .and_then(|stream| stream.inbound.clone())
         };
-        if let Some(inbound) = inbound
-            && let Err(error) = self.forward_inbound_payload(inbound, payload).await
-        {
-            debug!(
-                stream_id = header.stream_id,
-                user = %self.user.uuid,
-                %error,
-                "dropping stream after inbound forwarding failure"
-            );
-            self.drop_stream(header.stream_id).await;
+        match inbound {
+            Some(inbound) => {
+                if let Err(error) = read_and_forward_inbound_payload(
+                    &mut self.reader,
+                    &self.payload_pool,
+                    &inbound,
+                    header.length as usize,
+                    inbound_forward_segment_len(header.length as usize),
+                    self.lease.control(),
+                )
+                .await
+                {
+                    debug!(
+                        stream_id = header.stream_id,
+                        user = %self.user.uuid,
+                        %error,
+                        "dropping stream after inbound forwarding failure"
+                    );
+                    self.drop_stream(header.stream_id).await;
+                }
+            }
+            None => self.discard(header.length as usize).await?,
         }
         Ok(())
     }
@@ -399,57 +408,11 @@ impl Session {
     }
 
     async fn discard(&mut self, length: usize) -> anyhow::Result<()> {
-        if length == 0 {
-            return Ok(());
-        }
-        let mut discard = vec![0u8; length];
-        self.reader
-            .read_exact(&mut discard)
-            .await
-            .context("discard frame payload")?;
-        Ok(())
+        discard_exact(&mut self.reader, length).await
     }
 
     async fn write_frame(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
         write_frame(&self.writer, cmd, stream_id, payload).await
-    }
-
-    async fn forward_inbound_payload(
-        &self,
-        inbound: channel::InboundSender,
-        payload: PayloadBuffer,
-    ) -> anyhow::Result<()> {
-        if payload.len() <= LARGE_INBOUND_SEGMENT_LEN {
-            return self.forward_inbound_segment(&inbound, payload).await;
-        }
-
-        let segment_len = inbound_segment_len(payload.len());
-        for segment in payload.as_slice().chunks(segment_len) {
-            // Keep segmented uploads on the pooled-buffer path instead of
-            // materializing standalone `Vec`s for each slice.
-            let mut segment_buffer = self.payload_pool.take(segment.len());
-            segment_buffer.extend_from_slice(segment);
-            self.forward_inbound_segment(&inbound, segment_buffer)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn forward_inbound_segment(
-        &self,
-        inbound: &channel::InboundSender,
-        payload: PayloadBuffer,
-    ) -> anyhow::Result<()> {
-        match inbound.try_send_data(payload) {
-            Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-            Err(channel::TrySendError::Full(payload)) => {
-                let control = self.lease.control();
-                tokio::select! {
-                    _ = control.cancelled() => Ok(()),
-                    result = inbound.send_data(payload) => result,
-                }
-            }
-        }
     }
 }
 
@@ -468,6 +431,21 @@ async fn read_header(reader: &mut ReadHalf<TlsStream>) -> anyhow::Result<FrameHe
         stream_id: u32::from_be_bytes([header[1], header[2], header[3], header[4]]),
         length: u16::from_be_bytes([header[5], header[6]]),
     })
+}
+
+async fn discard_exact<R>(reader: &mut R, length: usize) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    if length == 0 {
+        return Ok(());
+    }
+    let mut discard = vec![0u8; length];
+    reader
+        .read_exact(&mut discard)
+        .await
+        .context("discard frame payload")?;
+    Ok(())
 }
 
 async fn read_exact_payload<R>(
@@ -500,6 +478,48 @@ where
         // SAFETY: `poll_read` only reports bytes in `filled()` after initializing them.
         unsafe {
             payload.advance_mut(read);
+        }
+    }
+    Ok(())
+}
+
+async fn send_inbound_segment(
+    inbound: &channel::InboundSender,
+    payload: PayloadBuffer,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()> {
+    match inbound.try_send_data(payload) {
+        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+        Err(channel::TrySendError::Full(payload)) => {
+            tokio::select! {
+                _ = control.cancelled() => Ok(()),
+                result = inbound.send_data(payload) => result,
+            }
+        }
+    }
+}
+
+async fn read_and_forward_inbound_payload<R>(
+    reader: &mut R,
+    payload_pool: &Arc<PayloadPool>,
+    inbound: &channel::InboundSender,
+    length: usize,
+    segment_len: usize,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let segment_len = segment_len.max(1);
+    let mut remaining = length;
+    while remaining > 0 {
+        let read_len = remaining.min(segment_len);
+        let mut payload = payload_pool.take(read_len);
+        read_exact_payload(reader, &mut payload, read_len).await?;
+        remaining -= read_len;
+        if let Err(error) = send_inbound_segment(inbound, payload, control.clone()).await {
+            discard_exact(reader, remaining).await?;
+            return Err(error);
         }
     }
     Ok(())
@@ -693,7 +713,7 @@ mod tests {
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         pump_copy, write_chunk_batch_for_test,
     };
-    use super::read_exact_payload;
+    use super::{read_and_forward_inbound_payload, read_exact_payload};
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
@@ -1105,6 +1125,70 @@ mod tests {
             .await
             .expect("read pooled payload");
         assert_eq!(payload.as_slice(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn forwards_large_psh_payload_segments_before_full_frame_arrives() {
+        let (mut stream_writer, mut stream_reader) = tokio::io::duplex(64 * 1024);
+        let payload_pool = Arc::new(PayloadPool::new(4));
+        let (inbound, mut rx) = bounded_inbound_channel(8, 64 * 1024);
+        let control = SessionControl::new();
+
+        let forward_task = tokio::spawn({
+            let payload_pool = payload_pool.clone();
+            let inbound = inbound.clone();
+            let control = control.clone();
+            async move {
+                read_and_forward_inbound_payload(
+                    &mut stream_reader,
+                    &payload_pool,
+                    &inbound,
+                    32 * 1024,
+                    16 * 1024,
+                    control,
+                )
+                .await
+            }
+        });
+
+        stream_writer
+            .write_all(&vec![1u8; 16 * 1024])
+            .await
+            .expect("write first segment");
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first forwarded segment should arrive")
+            .expect("first inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected first data segment");
+        };
+        assert_eq!(first.len(), 16 * 1024);
+        assert!(first.bytes().iter().all(|byte| *byte == 1));
+        assert!(
+            !forward_task.is_finished(),
+            "forwarding should still be waiting for the second half of the frame"
+        );
+
+        stream_writer
+            .write_all(&vec![2u8; 16 * 1024])
+            .await
+            .expect("write second segment");
+
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("second forwarded segment should arrive")
+            .expect("second inbound message");
+        let InboundMessage::Data(second) = second else {
+            panic!("expected second data segment");
+        };
+        assert_eq!(second.len(), 16 * 1024);
+        assert!(second.bytes().iter().all(|byte| *byte == 2));
+
+        forward_task
+            .await
+            .expect("join forward task")
+            .expect("forward large payload");
     }
 
     #[test]
