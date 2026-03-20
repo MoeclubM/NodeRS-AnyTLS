@@ -137,10 +137,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sing-version", default="latest")
     parser.add_argument("--enable-netem", action="store_true")
-    parser.add_argument("--long-connection-seconds", type=int, default=30)
-    parser.add_argument("--idle-seconds", type=int, default=95)
+    parser.add_argument("--long-connection-seconds", type=int, default=20)
+    parser.add_argument("--idle-seconds", type=int, default=65)
     parser.add_argument("--curve-sample-interval", type=float, default=1.0)
-    parser.add_argument("--steady-state-warmup-seconds", type=float, default=3.0)
+    parser.add_argument("--steady-state-warmup-seconds", type=float, default=2.0)
     parser.add_argument("--lossy-repeats", type=int, default=2)
     return parser.parse_args()
 

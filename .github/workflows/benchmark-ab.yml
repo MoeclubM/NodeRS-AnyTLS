@@ -16,11 +16,11 @@ on:
       long_connection_seconds:
         description: Duration in seconds for long upload and download benchmark cases
         required: false
-        default: "30"
+        default: "20"
       idle_seconds:
         description: Duration in seconds for idle keepalive stability cases
         required: false
-        default: "95"
+        default: "65"
       curve_sample_interval:
         description: Throughput curve sampling interval in seconds
         required: false
@@ -28,7 +28,7 @@ on:
       steady_state_warmup_seconds:
         description: Warmup duration before long-connection throughput and curve sampling
         required: false
-        default: "3.0"
+        default: "2.0"
       lossy_repeats:
         description: Repeat count for lossy benchmark cases; report uses median
         required: false
@@ -77,10 +77,10 @@ jobs:
           lossy_repeats="${{ github.event.inputs.lossy_repeats }}"
           compare_count="${compare_count:-2}"
           sing_box_version="${sing_box_version:-latest}"
-          long_connection_seconds="${long_connection_seconds:-30}"
-          idle_seconds="${idle_seconds:-95}"
+          long_connection_seconds="${long_connection_seconds:-20}"
+          idle_seconds="${idle_seconds:-65}"
           curve_sample_interval="${curve_sample_interval:-1.0}"
-          steady_state_warmup_seconds="${steady_state_warmup_seconds:-3.0}"
+          steady_state_warmup_seconds="${steady_state_warmup_seconds:-2.0}"
           lossy_repeats="${lossy_repeats:-2}"
           python3 scripts/benchmark_ab_report.py \
             --output-dir target/benchmark-ab \
