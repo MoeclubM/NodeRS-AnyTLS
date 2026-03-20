@@ -28,8 +28,6 @@ use self::rules::RouteRules;
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
-const TCP_BUFFER_BYTES: usize = 2 * 1024 * 1024;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveNodeConfig {
     pub listen_ip: String,
@@ -273,11 +271,6 @@ pub(super) fn configure_tcp_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
     let socket = SockRef::from(stream);
-    // The benchmark path runs through loopback netem. Starting with larger TCP buffers keeps
-    // both the AnyTLS session hop and outbound target hop from staying app-limited while the
-    // kernel scales up on high-latency or lossy links.
-    let _ = socket.set_send_buffer_size(TCP_BUFFER_BYTES);
-    let _ = socket.set_recv_buffer_size(TCP_BUFFER_BYTES);
     let _ = socket.set_tcp_keepalive(&keepalive);
 }
 
