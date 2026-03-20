@@ -57,6 +57,8 @@ jobs:
         run: cargo fetch --locked
 
       - name: Run version comparison benchmark
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           compare_count="${{ github.event.inputs.compare_count }}"
           sing_box_version="${{ github.event.inputs.sing_box_version }}"
@@ -99,4 +101,4 @@ jobs:
             target/benchmark-ab/summary.json
             target/benchmark-ab/benchmark-ab-report.json
             target/benchmark-ab/benchmark-ab-report.csv
-          if-no-files-found: error
+          if-no-files-found: warn

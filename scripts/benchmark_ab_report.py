@@ -774,7 +774,14 @@ def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Pat
 
 
 def github_json(url: str) -> dict:
-    request = urllib.request.Request(url, headers={"User-Agent": "NodeRS-AnyTLS-benchmark"})
+    headers = {
+        "User-Agent": "NodeRS-AnyTLS-benchmark",
+        "Accept": "application/vnd.github+json",
+    }
+    github_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if github_token:
+        headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request) as response:
         return json.load(response)
 
