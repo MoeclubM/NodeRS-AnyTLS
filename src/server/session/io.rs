@@ -15,7 +15,6 @@ use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
 #[cfg(target_env = "musl")]
 use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
-#[cfg(target_env = "musl")]
 use super::frame::LARGE_INBOUND_SEGMENT_LEN;
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
@@ -66,7 +65,6 @@ where
             &mut finished,
             policy,
         );
-        #[cfg(target_env = "musl")]
         if should_yield_for_upload_batch_fill(
             finished,
             pending.is_none(),
@@ -74,9 +72,9 @@ where
             queued_bytes,
             policy,
         ) {
-            // Musl remains the weakest weak-link upload target. Yield once when a fresh batch
-            // only has a single underfilled chunk so the immediately-following frame can join
-            // the same write without turning this into a blocking wait loop.
+            // A fresh weak-link upload batch can arrive as a single 32 KiB frame even when the
+            // next frame is already about to land on the following scheduler turn. Yield once so
+            // the second frame can join the same write and avoid leaving the tunnel app-limited.
             tokio::task::yield_now().await;
             fill_ready_upload_batch(
                 &mut rx,
@@ -125,7 +123,6 @@ where
     }
 }
 
-#[cfg(target_env = "musl")]
 fn should_yield_for_upload_batch_fill(
     finished: bool,
     no_pending_chunk: bool,
@@ -142,6 +139,7 @@ fn should_yield_for_upload_batch_fill(
         return false;
     }
 
+    #[cfg(target_env = "musl")]
     if policy.max_iovecs == SMALL_UPLOAD_BATCH_IOVECS {
         return queued_bytes <= SMALL_PAYLOAD_LEN;
     }
