@@ -31,8 +31,8 @@ use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY,
-    inbound_forward_segment_len, is_eof, padding_md5, parse_settings,
+    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
+    padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
@@ -240,13 +240,8 @@ impl Session {
         let mut payload = self.payload_pool.take(header.length as usize);
         read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
 
-        if let Err(error) = forward_buffered_inbound_payload(
-            &inbound,
-            &self.payload_pool,
-            self.lease.control(),
-            payload,
-        )
-        .await
+        if let Err(error) =
+            forward_buffered_inbound_payload(&inbound, self.lease.control(), payload).await
         {
             debug!(
                 stream_id = header.stream_id,
@@ -484,46 +479,20 @@ where
     Ok(())
 }
 
-async fn send_inbound_segment(
-    inbound: &channel::InboundSender,
-    payload: PayloadBuffer,
-    control: Arc<SessionControl>,
-) -> anyhow::Result<()> {
-    match inbound.try_send_data(payload) {
-        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-        Err(channel::TrySendError::Full(payload)) => {
-            tokio::select! {
-                _ = control.cancelled() => Ok(()),
-                result = inbound.send_data(payload) => result,
-            }
-        }
-    }
-}
-
 async fn forward_buffered_inbound_payload(
     inbound: &channel::InboundSender,
-    payload_pool: &Arc<PayloadPool>,
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
 ) -> anyhow::Result<()> {
+    // sing-anytls keeps PSH delivery as a whole-frame backpressure boundary instead of
+    // re-slicing the payload under pressure. Our frame size is already capped to u16::MAX,
+    // so forwarding the pooled buffer as a single unit avoids extra copies and fragmentation.
     match inbound.try_send_data(payload) {
         Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
-        Err(channel::TrySendError::Full(payload)) => {
-            let segment_len = inbound_forward_segment_len(payload.len());
-            if segment_len >= payload.len() {
-                return tokio::select! {
-                    _ = control.cancelled() => Ok(()),
-                    result = inbound.send_data(payload) => result,
-                };
-            }
-
-            for segment in payload.as_slice().chunks(segment_len) {
-                let mut segment_buffer = payload_pool.take(segment.len());
-                segment_buffer.extend_from_slice(segment);
-                send_inbound_segment(inbound, segment_buffer, control.clone()).await?;
-            }
-            Ok(())
-        }
+        Err(channel::TrySendError::Full(payload)) => tokio::select! {
+            _ = control.cancelled() => Ok(()),
+            result = inbound.send_data(payload) => result,
+        },
     }
 }
 
@@ -707,8 +676,7 @@ mod tests {
     };
     use super::frame::{
         CMD_PSH, CMD_SYNACK, MAX_FRAME_PAYLOAD_LEN, PayloadTier, download_coalesce_target,
-        inbound_forward_segment_len, parse_settings, payload_tier, should_flush_frame,
-        upload_batch_policy,
+        parse_settings, payload_tier, should_flush_frame, upload_batch_policy,
     };
     #[cfg(target_env = "musl")]
     use super::io::pump_inbound_to_remote;
@@ -1131,47 +1099,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn splits_large_buffered_payload_when_whole_chunk_would_overfill_budget() {
+    async fn waits_for_whole_buffered_payload_budget_without_fragmenting() {
         let payload_len = 48 * 1024;
-        let first_segment_len = inbound_forward_segment_len(payload_len);
-        let payload_pool = Arc::new(PayloadPool::new(4));
-        let (inbound, mut rx) = bounded_inbound_channel(8, first_segment_len);
+        let (inbound, mut rx) = bounded_inbound_channel(8, payload_len);
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
+        inbound
+            .try_send_data(PayloadBuffer::new(vec![3u8; payload_len]))
+            .expect("fill queue budget with first payload");
+
         let forward_task = tokio::spawn({
-            let payload_pool = payload_pool.clone();
             let inbound = inbound.clone();
             let control = control.clone();
-            async move {
-                forward_buffered_inbound_payload(&inbound, &payload_pool, control, payload).await
-            }
+            async move { forward_buffered_inbound_payload(&inbound, control, payload).await }
         });
 
         let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("first forwarded segment should arrive")
+            .expect("first queued payload should arrive")
             .expect("first inbound message");
         let InboundMessage::Data(first) = first else {
-            panic!("expected first data segment");
+            panic!("expected first data payload");
         };
-        assert_eq!(first.len(), first_segment_len);
-        assert!(first.bytes().iter().all(|byte| *byte == 7));
+        assert_eq!(first.len(), payload_len);
+        assert!(first.bytes().iter().all(|byte| *byte == 3));
         assert!(
             !forward_task.is_finished(),
-            "splitting should block on the remaining tail budget"
+            "whole-payload forwarding should wait for enough budget instead of fragmenting"
         );
 
         drop(first);
 
         let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("second forwarded segment should arrive")
+            .expect("second queued payload should arrive")
             .expect("second inbound message");
         let InboundMessage::Data(second) = second else {
-            panic!("expected second data segment");
+            panic!("expected second data payload");
         };
-        assert_eq!(second.len(), payload_len - first_segment_len);
+        assert_eq!(second.len(), payload_len);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
