@@ -124,8 +124,13 @@ def write_curve_report(
         if done.wait(min(remaining, 0.1)):
             break
 
-    while not done.wait(sample_interval):
-        now = time.perf_counter()
+    while True:
+        remaining_until_stop = stop_time - time.perf_counter()
+        if remaining_until_stop <= 0:
+            break
+        if done.wait(min(sample_interval, remaining_until_stop)):
+            break
+        now = min(time.perf_counter(), stop_time)
         total_bytes = sum(item.bytes for item in stats)
         interval_seconds = max(now - last_sample, 1e-6)
         samples.append(
