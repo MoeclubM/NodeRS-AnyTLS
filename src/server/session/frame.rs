@@ -35,6 +35,8 @@ pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 #[cfg(target_env = "musl")]
 pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
+#[cfg(target_env = "musl")]
+pub(super) const STREAMING_LARGE_INBOUND_SEGMENT_LEN: usize = 16 * 1024;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 4096;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
 // This queue doubles as the effective upload window between the AnyTLS session and the
@@ -90,6 +92,16 @@ pub(super) fn upload_batch_policy(first_chunk_len: usize) -> UploadBatchPolicy {
             max_bytes: LARGE_UPLOAD_BATCH_SIZE,
             max_iovecs: LARGE_UPLOAD_BATCH_IOVECS,
         },
+    }
+}
+
+pub(super) fn inbound_forward_segment_len(payload_len: usize) -> usize {
+    match payload_tier(payload_len) {
+        #[cfg(target_env = "musl")]
+        PayloadTier::Large => STREAMING_LARGE_INBOUND_SEGMENT_LEN,
+        #[cfg(not(target_env = "musl"))]
+        PayloadTier::Large => payload_len.max(1),
+        PayloadTier::Small | PayloadTier::Medium => payload_len.max(1),
     }
 }
 

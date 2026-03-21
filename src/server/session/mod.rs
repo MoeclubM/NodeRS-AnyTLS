@@ -31,8 +31,8 @@ use channel::{ChannelReader, PayloadBuffer, PayloadPool};
 use frame::{
     CMD_ALERT, CMD_FIN, CMD_HEART_REQUEST, CMD_HEART_RESPONSE, CMD_PSH, CMD_SERVER_SETTINGS,
     CMD_SETTINGS, CMD_SYN, CMD_SYNACK, CMD_UPDATE_PADDING_SCHEME, CMD_WASTE, FrameHeader,
-    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
-    padding_md5, parse_settings,
+    MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY,
+    inbound_forward_segment_len, is_eof, padding_md5, parse_settings,
 };
 use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
@@ -237,12 +237,25 @@ impl Session {
             return Ok(());
         };
 
-        let mut payload = self.payload_pool.take(header.length as usize);
-        read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
-
-        if let Err(error) =
+        let payload_len = header.length as usize;
+        let segment_len = inbound_forward_segment_len(payload_len);
+        let result = if segment_len < payload_len {
+            read_and_forward_inbound_payload(
+                &mut self.reader,
+                &self.payload_pool,
+                &inbound,
+                payload_len,
+                segment_len,
+                self.lease.control(),
+            )
+            .await
+        } else {
+            let mut payload = self.payload_pool.take(payload_len);
+            read_exact_payload(&mut self.reader, &mut payload, payload_len).await?;
             forward_buffered_inbound_payload(&inbound, self.lease.control(), payload).await
-        {
+        };
+
+        if let Err(error) = result {
             debug!(
                 stream_id = header.stream_id,
                 user = %self.user.uuid,
@@ -496,6 +509,34 @@ async fn forward_buffered_inbound_payload(
     }
 }
 
+async fn read_and_forward_inbound_payload<R>(
+    reader: &mut R,
+    payload_pool: &Arc<PayloadPool>,
+    inbound: &channel::InboundSender,
+    length: usize,
+    segment_len: usize,
+    control: Arc<SessionControl>,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let segment_len = segment_len.max(1);
+    let mut remaining = length;
+    while remaining > 0 {
+        let read_len = remaining.min(segment_len);
+        let mut payload = payload_pool.take(read_len);
+        read_exact_payload(reader, &mut payload, read_len).await?;
+        remaining -= read_len;
+        if let Err(error) =
+            forward_buffered_inbound_payload(inbound, control.clone(), payload).await
+        {
+            discard_exact(reader, remaining).await?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 async fn handle_stream(
     stream_id: u32,
     mut app_side: ChannelReader,
@@ -688,7 +729,9 @@ mod tests {
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
         pump_copy, write_chunk_batch_for_test,
     };
-    use super::{forward_buffered_inbound_payload, read_exact_payload};
+    use super::{
+        forward_buffered_inbound_payload, read_and_forward_inbound_payload, read_exact_payload,
+    };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
     use std::collections::VecDeque as TestVecDeque;
@@ -1149,6 +1192,70 @@ mod tests {
             .await
             .expect("join forward task")
             .expect("forward buffered payload");
+    }
+
+    #[tokio::test]
+    async fn forwards_large_psh_payload_segments_before_whole_frame_arrives() {
+        let (mut stream_writer, mut stream_reader) = tokio::io::duplex(64 * 1024);
+        let payload_pool = Arc::new(PayloadPool::new(4));
+        let (inbound, mut rx) = bounded_inbound_channel(8, 64 * 1024);
+        let control = SessionControl::new();
+
+        let forward_task = tokio::spawn({
+            let payload_pool = payload_pool.clone();
+            let inbound = inbound.clone();
+            let control = control.clone();
+            async move {
+                read_and_forward_inbound_payload(
+                    &mut stream_reader,
+                    &payload_pool,
+                    &inbound,
+                    32 * 1024,
+                    16 * 1024,
+                    control,
+                )
+                .await
+            }
+        });
+
+        stream_writer
+            .write_all(&vec![1u8; 16 * 1024])
+            .await
+            .expect("write first segment");
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first forwarded segment should arrive")
+            .expect("first inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected first data segment");
+        };
+        assert_eq!(first.len(), 16 * 1024);
+        assert!(first.bytes().iter().all(|byte| *byte == 1));
+        assert!(
+            !forward_task.is_finished(),
+            "forwarding should still be waiting for the second half of the frame"
+        );
+
+        stream_writer
+            .write_all(&vec![2u8; 16 * 1024])
+            .await
+            .expect("write second segment");
+
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("second forwarded segment should arrive")
+            .expect("second inbound message");
+        let InboundMessage::Data(second) = second else {
+            panic!("expected second data segment");
+        };
+        assert_eq!(second.len(), 16 * 1024);
+        assert!(second.bytes().iter().all(|byte| *byte == 2));
+
+        forward_task
+            .await
+            .expect("join forward task")
+            .expect("forward large payload");
     }
 
     #[test]
