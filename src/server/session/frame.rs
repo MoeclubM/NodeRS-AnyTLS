@@ -35,6 +35,10 @@ pub(super) const DEFAULT_UPLOAD_BATCH_IOVECS: usize = 64;
 pub(super) const MAX_UPLOAD_BATCH_IOVECS: usize = SMALL_UPLOAD_BATCH_IOVECS;
 #[cfg(target_env = "musl")]
 pub(super) const LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
+#[cfg(target_env = "musl")]
+pub(super) const STREAMING_LARGE_INBOUND_SEGMENT_LEN: usize = 24 * 1024;
+#[cfg(not(target_env = "musl"))]
+pub(super) const STREAMING_LARGE_INBOUND_SEGMENT_LEN: usize = 32 * 1024;
 pub(super) const STREAM_INBOUND_QUEUE_CAPACITY: usize = 4096;
 pub(super) const MAX_STREAMS_PER_SESSION: usize = 256;
 // This queue doubles as the effective upload window between the AnyTLS session and the
@@ -112,6 +116,13 @@ pub(super) fn download_coalesce_target(initial_read: usize) -> Option<usize> {
         return Some(MAX_FRAME_PAYLOAD_LEN);
     }
     None
+}
+
+pub(super) fn inbound_forward_segment_len(payload_len: usize) -> usize {
+    match payload_tier(payload_len) {
+        PayloadTier::Large => STREAMING_LARGE_INBOUND_SEGMENT_LEN,
+        PayloadTier::Small | PayloadTier::Medium => payload_len.max(1),
+    }
 }
 
 pub(super) fn parse_settings(bytes: &[u8]) -> HashMap<String, String> {
