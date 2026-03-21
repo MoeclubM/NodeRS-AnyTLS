@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from statistics import median
 from contextlib import ExitStack, contextmanager
@@ -37,6 +38,7 @@ class Case:
     category: str = "throughput"
     capture_curve: bool = False
     warmup_seconds: float | None = None
+    proxy_profile: str | None = None
 
 
 @dataclass
@@ -48,7 +50,7 @@ class Implementation:
     binary: pathlib.Path
 
 
-def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
+def build_full_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
     long_connection_seconds = max(5, long_connection_seconds)
     idle_seconds = max(5, idle_seconds)
     cases = [
@@ -104,11 +106,72 @@ def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
     return cases
 
 
+def build_quick_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
+    long_connection_seconds = max(5, long_connection_seconds)
+    # Keep the quick idle case long enough to cross the server heartbeat window.
+    idle_seconds = max(35, idle_seconds)
+    return [
+        Case(
+            "upload-long-connection",
+            "upload",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+        ),
+        Case(
+            "download-long-connection",
+            "download",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+        ),
+        Case(
+            "upload-long-connection-high-latency",
+            "upload",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+            warmup_seconds=2.0,
+            proxy_profile="high-latency",
+        ),
+        Case(
+            "download-long-connection-high-latency",
+            "download",
+            1,
+            32768,
+            long_connection_seconds,
+            capture_curve=True,
+            proxy_profile="high-latency",
+        ),
+        Case(
+            f"idle-keepalive-{idle_seconds}s",
+            "idle",
+            2,
+            1024,
+            idle_seconds,
+            category="stability",
+        ),
+    ]
+
+
+def build_cases(long_connection_seconds: int, idle_seconds: int, benchmark_tier: str) -> list[Case]:
+    if benchmark_tier == "quick":
+        return build_quick_cases(long_connection_seconds, idle_seconds)
+    return build_full_cases(long_connection_seconds, idle_seconds)
+
+
 NETEM_PROFILES = {
     "high-latency-lossy": ["delay", "200ms", "loss", "0.5%"],
     "high-loss-low-latency-lossy": ["delay", "55ms", "loss", "20%"],
     # Approximate a mostly-40 ms path with occasional high-delay spikes.
     "jittery-lossy": ["delay", "40ms", "150ms", "distribution", "paretonormal", "loss", "6%"],
+}
+
+TCP_PROXY_PROFILES: dict[str, list[str]] = {
+    "high-latency": ["--latency-ms", "200"],
 }
 
 FIXED_COMPARE_TAGS = ["v0.0.23"]
@@ -130,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare current NodeRS, previous tags, and sing-box on Linux.")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--target", default="x86_64-unknown-linux-musl")
+    parser.add_argument("--benchmark-tier", choices=["quick", "full"], default="full")
     parser.add_argument(
         "--compare-count",
         type=int,
@@ -788,6 +852,38 @@ def start_sing_clients(
     return proxies
 
 
+def start_impairment_proxy(
+    stack: ExitStack,
+    *,
+    bench_binary: pathlib.Path,
+    logs_dir: pathlib.Path,
+    log_prefix: str,
+    upstream_port: int,
+    profile_name: str,
+) -> int:
+    profile_args = TCP_PROXY_PROFILES.get(profile_name)
+    if profile_args is None:
+        raise RuntimeError(f"unknown tcp-proxy profile {profile_name}")
+    listen_port = reserve_port()
+    stack.enter_context(
+        started_process(
+            [
+                str(bench_binary),
+                "tcp-proxy",
+                "--listen",
+                f"127.0.0.1:{listen_port}",
+                "--upstream",
+                f"127.0.0.1:{upstream_port}",
+                *profile_args,
+            ],
+            stdout_path=logs_dir / f"{log_prefix}.tcp-proxy.stdout.log",
+            stderr_path=logs_dir / f"{log_prefix}.tcp-proxy.stderr.log",
+            ready_port=listen_port,
+        )
+    )
+    return listen_port
+
+
 def benchmark_impl(
     implementation: Implementation,
     *,
@@ -855,13 +951,23 @@ def benchmark_impl(
                     )
                     with applied_netem(case.netem_profile, enable_netem, server_port):
                         with ExitStack() as attempt_stack:
+                            client_server_port = server_port
+                            if case.proxy_profile is not None:
+                                client_server_port = start_impairment_proxy(
+                                    attempt_stack,
+                                    bench_binary=bench_binary,
+                                    logs_dir=impl_dir,
+                                    log_prefix=log_prefix,
+                                    upstream_port=server_port,
+                                    profile_name=case.proxy_profile,
+                                )
                             target_port = reserve_port()
                             proxies = start_sing_clients(
                                 attempt_stack,
                                 sing_binary=sing_binary,
                                 work_dir=work_dir,
                                 logs_dir=impl_dir,
-                                server_port=server_port,
+                                server_port=client_server_port,
                                 client_count=case.parallel,
                                 log_prefix=log_prefix,
                             )
@@ -944,7 +1050,50 @@ def build_current_variant(
     return binary_path(target_dir, target, "noders-anytls"), binary_path(target_dir, target, "bench_anytls")
 
 
+def release_asset_name_for_target(ref: str, target: str) -> str | None:
+    target_asset_names = {
+        "x86_64-unknown-linux-musl": f"noders-anytls-{ref}-linux-amd64-musl.tar.gz",
+        "x86_64-unknown-linux-gnu": f"noders-anytls-{ref}-linux-amd64.tar.gz",
+    }
+    return target_asset_names.get(target)
+
+
+def download_ref_release(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path | None:
+    asset_name = release_asset_name_for_target(ref, target)
+    if asset_name is None:
+        return None
+
+    try:
+        release = github_json(f"https://api.github.com/repos/MoeclubM/NodeRS-AnyTLS/releases/tags/{ref}")
+    except urllib.error.HTTPError:
+        return None
+    asset = next((item for item in release.get("assets", []) if item["name"] == asset_name), None)
+    if asset is None:
+        return None
+
+    release_root = output_dir / "release-binaries"
+    release_root.mkdir(parents=True, exist_ok=True)
+    extract_root = release_root / ref.replace("/", "_")
+    binary_path_local = extract_root / asset_name[: -len(".tar.gz")] / "noders-anytls"
+    if binary_path_local.exists():
+        return binary_path_local
+
+    archive_path = release_root / asset_name
+    if not archive_path.exists():
+        urllib.request.urlretrieve(asset["browser_download_url"], archive_path)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(extract_root)
+    if not binary_path_local.exists():
+        raise RuntimeError(f"unexpected release archive layout for {asset_name}")
+    binary_path_local.chmod(0o755)
+    return binary_path_local
+
+
 def build_ref(ref: str, *, output_dir: pathlib.Path, target: str) -> pathlib.Path:
+    released_binary = download_ref_release(ref, output_dir=output_dir, target=target)
+    if released_binary is not None:
+        return released_binary
+
     worktree_root = output_dir / "worktrees"
     build_root = output_dir / "build-tags"
     worktree_root.mkdir(parents=True, exist_ok=True)
@@ -1084,6 +1233,7 @@ def write_outputs(
     previous_tags: list[str],
     sing_version: str,
     steady_state_warmup_seconds: float,
+    benchmark_tier: str,
     result_rows: list[dict[str, object]],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1093,6 +1243,7 @@ def write_outputs(
     latency_group = list(throughput_group)
     raw_json = {
         "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "benchmark_tier": benchmark_tier,
         "current_impl": current_impl,
         "previous_tags": previous_tags,
         "sing_box_version": sing_version,
@@ -1116,6 +1267,7 @@ def write_outputs(
     lines = [
         "# Benchmark AB Report",
         "",
+        f"- Benchmark tier: `{benchmark_tier}`",
         f"- Current: `{current_impl}`",
         f"- Previous tags: {', '.join(f'`{tag}`' for tag in previous_tags) if previous_tags else 'none'}",
         f"- Sing-box: `{sing_version}`",
@@ -1135,6 +1287,11 @@ def write_outputs(
         lines[8:8] = [
             "- Scenario-specific warmup seconds: "
             + ", ".join(f"`{case.name}={case.warmup_seconds:.1f}`" for case in warmup_overrides),
+        ]
+    proxy_cases = [case.name for case in cases if case.proxy_profile is not None]
+    if proxy_cases:
+        lines[8:8] = [
+            "- Proxy-shaped scenarios: " + ", ".join(f"`{case_name}`" for case_name in proxy_cases),
         ]
     throughput_summary_rows: list[dict[str, object]] = []
     benchmark_notes: list[dict[str, object]] = []
@@ -1448,6 +1605,37 @@ def write_outputs(
                             ),
                         }
                     )
+                scenario_values = [
+                    float(row["mbps"])
+                    for row in scenario_rows.values()
+                    if isinstance(row.get("mbps"), (int, float))
+                ]
+                scenario_zero_windows = [
+                    row
+                    for row in scenario_rows.values()
+                    if isinstance(row.get("curve_min_mbps"), (int, float))
+                    and float(row["curve_min_mbps"]) <= 0.0
+                ]
+                if (
+                    case.mode == "upload"
+                    and len(scenario_values) >= 3
+                    and min(scenario_values) > 0.0
+                    and max(scenario_values) <= 5.0
+                    and max(scenario_values) / min(scenario_values) <= 2.0
+                    and len(scenario_zero_windows) >= len(scenario_values) - 1
+                ):
+                    benchmark_notes.append(
+                        {
+                            "scenario": case.name,
+                            "impl": "all",
+                            "severity": "warn",
+                            "kind": "scenario_collapse",
+                            "message": (
+                                "all implementations collapsed into the same low-throughput pulsed regime; "
+                                "treat this weak-link case as unstable benchmark infrastructure"
+                            ),
+                        }
+                    )
 
         lines.extend(
             [
@@ -1527,7 +1715,7 @@ def main() -> int:
     args = parse_args()
     output_dir = pathlib.Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    cases = build_cases(args.long_connection_seconds, args.idle_seconds)
+    cases = build_cases(args.long_connection_seconds, args.idle_seconds, args.benchmark_tier)
 
     current_commit = git_output("rev-parse", "HEAD")
     previous_tags = select_previous_tags(args.compare_count)
@@ -1589,6 +1777,7 @@ def main() -> int:
         previous_tags=previous_tags,
         sing_version=sing_version,
         steady_state_warmup_seconds=args.steady_state_warmup_seconds,
+        benchmark_tier=args.benchmark_tier,
         result_rows=result_rows,
     )
     print(output_dir / "report.md")

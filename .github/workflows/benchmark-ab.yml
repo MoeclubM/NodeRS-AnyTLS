@@ -5,38 +5,38 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      compare_count:
-        description: Total previous tags to compare; default is fixed v0.0.23 plus the latest previous tag
+      benchmark_tier:
+        description: quick for the fast CI profile, full for the extended weak-link suite
         required: false
-        default: "2"
+        default: full
+      compare_count:
+        description: Total previous tags to compare; leave blank to use the selected tier default
+        required: false
+        default: ""
       sing_box_version:
         description: sing-box release tag or latest
         required: false
         default: latest
       long_connection_seconds:
-        description: Duration in seconds for long upload and download benchmark cases
+        description: Duration in seconds for long upload and download benchmark cases; leave blank to use the selected tier default
         required: false
-        default: "20"
+        default: ""
       idle_seconds:
-        description: Duration in seconds for idle keepalive stability cases
+        description: Duration in seconds for idle keepalive stability cases; leave blank to use the selected tier default
         required: false
-        default: "65"
+        default: ""
       curve_sample_interval:
-        description: Throughput curve sampling interval in seconds
+        description: Throughput curve sampling interval in seconds; leave blank to use the selected tier default
         required: false
-        default: "1.0"
+        default: ""
       steady_state_warmup_seconds:
-        description: Warmup duration before long-connection throughput and curve sampling
+        description: Warmup duration before long-connection throughput and curve sampling; leave blank to use the selected tier default
         required: false
-        default: "2.0"
+        default: ""
       lossy_repeats:
-        description: Repeat count for lossy benchmark cases; report uses median
+        description: Repeat count for lossy benchmark cases; leave blank to use the selected tier default
         required: false
-        default: "2"
-
-concurrency:
-  group: benchmark-ab-${{ github.ref }}
-  cancel-in-progress: true
+        default: ""
 
 jobs:
   version-compare:
@@ -68,6 +68,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          benchmark_tier="${{ github.event.inputs.benchmark_tier }}"
           compare_count="${{ github.event.inputs.compare_count }}"
           sing_box_version="${{ github.event.inputs.sing_box_version }}"
           long_connection_seconds="${{ github.event.inputs.long_connection_seconds }}"
@@ -75,16 +76,35 @@ jobs:
           curve_sample_interval="${{ github.event.inputs.curve_sample_interval }}"
           steady_state_warmup_seconds="${{ github.event.inputs.steady_state_warmup_seconds }}"
           lossy_repeats="${{ github.event.inputs.lossy_repeats }}"
-          compare_count="${compare_count:-2}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            benchmark_tier="${benchmark_tier:-quick}"
+          else
+            benchmark_tier="${benchmark_tier:-full}"
+          fi
+          if [ "$benchmark_tier" = "quick" ]; then
+            compare_count="${compare_count:-0}"
+            long_connection_seconds="${long_connection_seconds:-8}"
+            idle_seconds="${idle_seconds:-35}"
+            curve_sample_interval="${curve_sample_interval:-1.0}"
+            steady_state_warmup_seconds="${steady_state_warmup_seconds:-1.0}"
+            lossy_repeats="${lossy_repeats:-1}"
+          else
+            compare_count="${compare_count:-2}"
+            long_connection_seconds="${long_connection_seconds:-20}"
+            idle_seconds="${idle_seconds:-65}"
+            curve_sample_interval="${curve_sample_interval:-1.0}"
+            steady_state_warmup_seconds="${steady_state_warmup_seconds:-2.0}"
+            lossy_repeats="${lossy_repeats:-2}"
+          fi
           sing_box_version="${sing_box_version:-latest}"
-          long_connection_seconds="${long_connection_seconds:-20}"
-          idle_seconds="${idle_seconds:-65}"
-          curve_sample_interval="${curve_sample_interval:-1.0}"
-          steady_state_warmup_seconds="${steady_state_warmup_seconds:-2.0}"
-          lossy_repeats="${lossy_repeats:-2}"
+          enable_netem_args=()
+          if [ "$benchmark_tier" = "full" ]; then
+            enable_netem_args+=(--enable-netem)
+          fi
           python3 scripts/benchmark_ab_report.py \
             --output-dir target/benchmark-ab \
             --target x86_64-unknown-linux-musl \
+            --benchmark-tier "$benchmark_tier" \
             --compare-count "$compare_count" \
             --sing-version "$sing_box_version" \
             --long-connection-seconds "$long_connection_seconds" \
@@ -92,7 +112,7 @@ jobs:
             --curve-sample-interval "$curve_sample_interval" \
             --steady-state-warmup-seconds "$steady_state_warmup_seconds" \
             --lossy-repeats "$lossy_repeats" \
-            --enable-netem
+            "${enable_netem_args[@]}"
 
       - name: Publish version comparison summary
         if: always()
