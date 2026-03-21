@@ -36,6 +36,7 @@ class Case:
     netem_profile: str | None = None
     category: str = "throughput"
     capture_curve: bool = False
+    warmup_seconds: float | None = None
 
 
 @dataclass
@@ -87,6 +88,7 @@ def build_cases(long_connection_seconds: int, idle_seconds: int) -> list[Case]:
                     long_connection_seconds,
                     profile_name,
                     capture_curve=True,
+                    warmup_seconds=8.0 if profile_name == "high-latency-lossy" else None,
                 ),
                 Case(
                     f"download-long-connection-{profile_name}",
@@ -523,6 +525,11 @@ def run_compare_socks(
     stdout_path = logs_dir / f"{prefix}.stdout.log"
     stderr_path = logs_dir / f"{prefix}.stderr.log"
     curve_path = logs_dir / f"{prefix}.curve.json"
+    measure_warmup_seconds = (
+        case.warmup_seconds
+        if case.warmup_seconds is not None
+        else max(steady_state_warmup_seconds, 0.0)
+    )
     command = [
         sys.executable,
         str(COMPARE_SOCKS),
@@ -539,7 +546,7 @@ def run_compare_socks(
         "--chunk-size",
         str(case.chunk_size),
         "--measure-warmup-seconds",
-        str(max(steady_state_warmup_seconds, 0.0)),
+        str(measure_warmup_seconds),
     ]
     if case.capture_curve:
         command.extend(["--curve-file", str(curve_path), "--sample-interval", str(curve_sample_interval)])
@@ -1125,13 +1132,21 @@ def write_outputs(
         f"- Sing-box: `{sing_version}`",
         f"- Long connection seconds: `{max((case.seconds for case in curve_group), default=0)}`",
         f"- Idle seconds: `{max((case.seconds for case in stability_group), default=0)}`",
-        f"- Steady-state warmup seconds: `{max(steady_state_warmup_seconds, 0.0):.1f}`",
+        f"- Default steady-state warmup seconds: `{max(steady_state_warmup_seconds, 0.0):.1f}`",
         "",
         "## Real Connection Throughput",
         "",
         "| Scenario | " + " | ".join(impl_order) + " | Current vs Best Prev | Current vs Sing-box |",
         "| --- | " + " | ".join(["---"] * len(impl_order)) + " | --- | --- |",
     ]
+    warmup_overrides = [
+        case for case in cases if case.warmup_seconds is not None and case.warmup_seconds != steady_state_warmup_seconds
+    ]
+    if warmup_overrides:
+        lines[8:8] = [
+            "- Scenario-specific warmup seconds: "
+            + ", ".join(f"`{case.name}={case.warmup_seconds:.1f}`" for case in warmup_overrides),
+        ]
     throughput_summary_rows: list[dict[str, object]] = []
     benchmark_notes: list[dict[str, object]] = []
     for case in throughput_group:
