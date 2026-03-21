@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{Context, ensure};
 use std::collections::VecDeque;
 use std::future::poll_fn;
@@ -20,10 +18,10 @@ use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 #[cfg(target_env = "musl")]
 use super::frame::LARGE_INBOUND_SEGMENT_LEN;
 use super::frame::{
-    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, LARGE_UPLOAD_BATCH_IOVECS,
-    MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS, SMALL_DATA_FRAME_FLUSH_THRESHOLD,
-    SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN, SMALL_UPLOAD_BATCH_IOVECS,
-    download_coalesce_target, upload_batch_policy,
+    CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, DEFAULT_UPLOAD_BATCH_SIZE,
+    LARGE_UPLOAD_BATCH_IOVECS, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
+    SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
+    SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
 };
 #[cfg(target_env = "musl")]
 use super::writer::write_prefixed_frame;
@@ -59,7 +57,7 @@ where
             chunks.push_back(chunk);
             front_offset = 0;
         }
-        let policy = upload_batch_policy_for_chunks(&chunks);
+        let policy = upload_batch_policy_for_chunks(&chunks, front_offset);
         fill_ready_upload_batch(
             &mut rx,
             &mut chunks,
@@ -447,12 +445,21 @@ where
 
 fn upload_batch_policy_for_chunks(
     chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
 ) -> super::frame::UploadBatchPolicy {
     let front_len = chunks.front().map(BufferedChunk::len).unwrap_or_default();
-    // Anchor the batch tier to the original leading chunk size. Partial writes can
-    // leave a tiny front tail behind; reclassifying the whole batch from that tail
-    // alone shrinks large uploads into the small-batch policy on the next write.
-    upload_batch_policy(front_len)
+    let policy = upload_batch_policy(front_len);
+    // A partial large-batch write is a concrete backpressure signal from the outbound socket.
+    // Keep the remaining chunk on the large-tier path semantically, but narrow the very next
+    // retry to the default tier so lossy high-BDP links do not immediately receive another
+    // full 256 KiB burst.
+    if front_offset > 0 && policy.max_iovecs == LARGE_UPLOAD_BATCH_IOVECS {
+        return super::frame::UploadBatchPolicy {
+            max_bytes: DEFAULT_UPLOAD_BATCH_SIZE,
+            max_iovecs: DEFAULT_UPLOAD_BATCH_IOVECS,
+        };
+    }
+    policy
 }
 
 pub(super) async fn coalesce_download_reads<R>(
@@ -605,8 +612,9 @@ pub(super) fn chunk_batch_slices(
 #[cfg(test)]
 pub(super) fn chunk_batch_policy(
     chunks: &VecDeque<BufferedChunk>,
+    front_offset: usize,
 ) -> super::frame::UploadBatchPolicy {
-    upload_batch_policy_for_chunks(chunks)
+    upload_batch_policy_for_chunks(chunks, front_offset)
 }
 
 pub(super) fn advance_chunk_batch(

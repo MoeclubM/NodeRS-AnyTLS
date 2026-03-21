@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use parking_lot::Mutex;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
@@ -87,6 +85,7 @@ impl PayloadBuffer {
         self.bytes.clear();
     }
 
+    #[cfg(test)]
     pub(super) fn extend_from_slice(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }

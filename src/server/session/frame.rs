@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::Error;
 use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;

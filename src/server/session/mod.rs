@@ -34,7 +34,7 @@ use frame::{
     MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
     padding_md5, parse_settings,
 };
-use io::{pump_copy, pump_remote_to_client};
+use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
@@ -647,20 +647,19 @@ async fn handle_stream(
 }
 
 async fn handle_tcp_stream(
-    mut app_side: ChannelReader,
+    app_side: ChannelReader,
     stream: &mut TcpStream,
     context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut read_b, mut write_b) = stream.split();
-    // After the SOCKS target has been parsed, the remaining TCP upload path can stream
-    // directly from ChannelReader and release queue budget as bytes are copied onward.
-    app_side.enable_budget_release_on_read();
-    let upload = pump_copy(
-        &mut app_side,
+    let (pending, inbound_rx, inbound_finished) = app_side.into_parts();
+    let upload = pump_inbound_to_remote(
+        pending,
+        inbound_rx,
+        inbound_finished,
         &mut write_b,
         context.control.clone(),
         Some(context.upload_traffic),
-        None,
     );
     let download = pump_remote_to_client(
         &mut read_b,
@@ -1241,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_front_write_keeps_large_upload_batch_policy() {
+    fn partial_front_write_narrows_large_upload_batch_policy() {
         let large = vec![7u8; 32 * 1024];
         let chunks = std::collections::VecDeque::from([
             test_chunk(&large),
@@ -1254,12 +1253,12 @@ mod tests {
             test_chunk(&large),
             test_chunk(&large),
         ]);
-        let policy = chunk_batch_policy(&chunks);
+        let policy = chunk_batch_policy(&chunks, 31 * 1024);
         let slices = chunk_batch_slices(&chunks, 31 * 1024, policy);
         let total: usize = slices.iter().map(|slice| slice.len()).sum();
 
-        assert_eq!(policy.max_bytes, upload_batch_policy(32 * 1024).max_bytes);
-        assert_eq!(policy.max_iovecs, upload_batch_policy(32 * 1024).max_iovecs);
+        assert_eq!(policy.max_bytes, upload_batch_policy(8 * 1024).max_bytes);
+        assert_eq!(policy.max_iovecs, upload_batch_policy(8 * 1024).max_iovecs);
         assert_eq!(total, policy.max_bytes);
     }
 
