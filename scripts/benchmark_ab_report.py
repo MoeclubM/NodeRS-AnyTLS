@@ -450,6 +450,29 @@ def summarize_failure(stderr_text: str) -> str:
     return lines[-1] if lines else "benchmark command failed"
 
 
+def validate_case_metrics(case: Case, metrics: dict[str, object]) -> dict[str, object]:
+    if metrics.get("status") != "pass":
+        return metrics
+
+    measured_bytes = int(metrics.get("bytes") or 0)
+    if case.mode == "upload" and measured_bytes <= 0:
+        metrics["status"] = "fail"
+        metrics["error"] = "no bytes transferred during measurement window"
+        return metrics
+
+    if case.mode == "download":
+        if measured_bytes <= 0:
+            metrics["status"] = "fail"
+            metrics["error"] = "no bytes transferred during measurement window"
+            return metrics
+        if metrics.get("first_byte_ms") is None:
+            metrics["status"] = "fail"
+            metrics["error"] = "no first byte observed before measurement ended"
+            return metrics
+
+    return metrics
+
+
 def run_compare_socks(
     *,
     proxies: list[str],
@@ -507,6 +530,7 @@ def run_compare_socks(
         metrics["curve_samples"] = curve.get("samples", [])
         metrics["curve_log"] = str(curve_path)
         metrics.update(summarize_curve(metrics["curve_samples"]))
+    metrics = validate_case_metrics(case, metrics)
     metrics["stdout_log"] = str(stdout_path)
     metrics["stderr_log"] = str(stderr_path)
     return metrics
