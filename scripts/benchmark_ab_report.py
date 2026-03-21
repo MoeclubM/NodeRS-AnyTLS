@@ -805,20 +805,9 @@ def benchmark_impl(
     with tempfile.TemporaryDirectory(prefix=f"benchmark-{implementation.label}-") as temp_dir:
         work_dir = pathlib.Path(temp_dir)
         cert_path, key_path = ensure_tls_materials(work_dir)
-        sink_port = reserve_port()
-        source_port = reserve_port()
         server_port = reserve_port()
 
         with ExitStack() as stack:
-            stack.enter_context(
-                started_process(
-                    [str(bench_binary), "sink", "--listen", f"127.0.0.1:{sink_port}"],
-                    stdout_path=impl_dir / "sink.stdout.log",
-                    stderr_path=impl_dir / "sink.stderr.log",
-                    ready_port=sink_port,
-                )
-            )
-
             if implementation.kind == "singbox":
                 server_config = work_dir / "sing-server.json"
                 write_sing_server_config(
@@ -866,6 +855,7 @@ def benchmark_impl(
                     )
                     with applied_netem(case.netem_profile, enable_netem, server_port):
                         with ExitStack() as attempt_stack:
+                            target_port = reserve_port()
                             proxies = start_sing_clients(
                                 attempt_stack,
                                 sing_binary=sing_binary,
@@ -882,34 +872,33 @@ def benchmark_impl(
                                             str(bench_binary),
                                             "source",
                                             "--listen",
-                                            f"127.0.0.1:{source_port}",
+                                            f"127.0.0.1:{target_port}",
                                             "--chunk-size",
                                             str(case.chunk_size),
                                         ],
                                         stdout_path=impl_dir / f"{log_prefix}.source.stdout.log",
                                         stderr_path=impl_dir / f"{log_prefix}.source.stderr.log",
-                                        ready_port=source_port,
+                                        ready_port=target_port,
                                     )
                                 )
-                                metrics = run_compare_socks(
-                                    proxies=proxies,
-                                    target=f"127.0.0.1:{source_port}",
-                                    case=case,
-                                    curve_sample_interval=curve_sample_interval,
-                                    steady_state_warmup_seconds=steady_state_warmup_seconds,
-                                    logs_dir=impl_dir,
-                                    log_prefix=log_prefix,
-                                )
                             else:
-                                metrics = run_compare_socks(
-                                    proxies=proxies,
-                                    target=f"127.0.0.1:{sink_port}",
-                                    case=case,
-                                    curve_sample_interval=curve_sample_interval,
-                                    steady_state_warmup_seconds=steady_state_warmup_seconds,
-                                    logs_dir=impl_dir,
-                                    log_prefix=log_prefix,
+                                attempt_stack.enter_context(
+                                    started_process(
+                                        [str(bench_binary), "sink", "--listen", f"127.0.0.1:{target_port}"],
+                                        stdout_path=impl_dir / f"{log_prefix}.sink.stdout.log",
+                                        stderr_path=impl_dir / f"{log_prefix}.sink.stderr.log",
+                                        ready_port=target_port,
+                                    )
                                 )
+                            metrics = run_compare_socks(
+                                proxies=proxies,
+                                target=f"127.0.0.1:{target_port}",
+                                case=case,
+                                curve_sample_interval=curve_sample_interval,
+                                steady_state_warmup_seconds=steady_state_warmup_seconds,
+                                logs_dir=impl_dir,
+                                log_prefix=log_prefix,
+                            )
                     case_attempts.append(metrics)
                 metrics = aggregate_case_attempts(case, case_attempts)
                 rows.append(
