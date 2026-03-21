@@ -34,7 +34,7 @@ use frame::{
     MAX_STREAMS_PER_SESSION, STREAM_INBOUND_QUEUE_BYTES, STREAM_INBOUND_QUEUE_CAPACITY, is_eof,
     padding_md5, parse_settings,
 };
-use io::{pump_copy, pump_inbound_to_remote, pump_remote_to_client};
+use io::{pump_copy, pump_remote_to_client};
 use writer::{FrameWriter, write_frame};
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
@@ -643,19 +643,17 @@ async fn handle_stream(
 }
 
 async fn handle_tcp_stream(
-    app_side: ChannelReader,
+    mut app_side: ChannelReader,
     stream: &mut TcpStream,
     context: TcpStreamContext,
 ) -> anyhow::Result<(u64, u64)> {
     let (mut read_b, mut write_b) = stream.split();
-    let (pending, inbound_rx, inbound_finished) = app_side.into_parts();
-    let upload = pump_inbound_to_remote(
-        pending,
-        inbound_rx,
-        inbound_finished,
+    let upload = pump_copy(
+        &mut app_side,
         &mut write_b,
         context.control.clone(),
         Some(context.upload_traffic),
+        None,
     );
     let download = pump_remote_to_client(
         &mut read_b,

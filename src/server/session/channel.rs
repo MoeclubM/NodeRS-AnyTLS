@@ -436,19 +436,6 @@ impl ChannelReader {
             finished: false,
         }
     }
-
-    pub(super) fn into_parts(
-        self,
-    ) -> (Option<BufferedChunk>, mpsc::Receiver<InboundMessage>, bool) {
-        let pending = self.current.and_then(|current| {
-            if self.offset < current.len() {
-                Some(current.split_off(self.offset))
-            } else {
-                None
-            }
-        });
-        (pending, self.rx, self.finished)
-    }
 }
 
 impl AsyncRead for ChannelReader {
@@ -460,24 +447,25 @@ impl AsyncRead for ChannelReader {
         let mut wrote_any = false;
         loop {
             let offset = self.offset;
-            if let Some(current) = self.current.as_ref()
-                && offset < current.len()
-            {
-                let remaining = &current.bytes()[offset..];
-                let to_copy = remaining.len().min(buf.remaining());
-                buf.put_slice(&remaining[..to_copy]);
-                wrote_any = true;
-                let new_offset = offset + to_copy;
-                if new_offset >= current.len() {
-                    self.current = None;
-                    self.offset = 0;
-                } else {
-                    self.offset = new_offset;
+            if let Some(current) = self.current.as_mut() {
+                if offset < current.len() {
+                    let remaining = &current.bytes()[offset..];
+                    let to_copy = remaining.len().min(buf.remaining());
+                    buf.put_slice(&remaining[..to_copy]);
+                    current.release_written(to_copy);
+                    wrote_any = true;
+                    let new_offset = offset + to_copy;
+                    if new_offset >= current.len() {
+                        self.current = None;
+                        self.offset = 0;
+                    } else {
+                        self.offset = new_offset;
+                    }
+                    if buf.remaining() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    continue;
                 }
-                if buf.remaining() == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                continue;
             }
 
             if self.finished {
@@ -521,6 +509,7 @@ pub(super) fn test_chunk(bytes: &[u8]) -> BufferedChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn sender_enforces_byte_budget() {
@@ -633,6 +622,33 @@ mod tests {
                 .try_send_data(PayloadBuffer::new(vec![6, 7]))
                 .is_err(),
             "only the unread tail budget should remain reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_reader_releases_budget_as_bytes_are_read() {
+        let (sender, rx) = bounded_inbound_channel(8, 4);
+        sender
+            .try_send_data(PayloadBuffer::new(vec![1, 2, 3, 4]))
+            .expect("send chunk");
+
+        let mut reader = ChannelReader::new(rx);
+        let mut head = [0u8; 2];
+        reader
+            .read_exact(&mut head)
+            .await
+            .expect("read partial chunk");
+        assert_eq!(&head, &[1, 2]);
+
+        assert!(
+            sender.try_send_data(PayloadBuffer::new(vec![5, 6])).is_ok(),
+            "partially consumed bytes should free matching budget immediately"
+        );
+        assert!(
+            sender
+                .try_send_data(PayloadBuffer::new(vec![7, 8, 9]))
+                .is_err(),
+            "the unread tail should remain reserved after a partial read"
         );
     }
 
