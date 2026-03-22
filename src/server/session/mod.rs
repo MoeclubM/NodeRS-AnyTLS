@@ -781,8 +781,7 @@ mod tests {
     };
     use super::{
         SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, WHOLE_PAYLOAD_RETRY_GRACE,
-        forward_buffered_inbound_payload,
-        read_exact_payload,
+        forward_buffered_inbound_payload, read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
