@@ -39,8 +39,8 @@ use writer::{FrameWriter, write_frame};
 
 const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
 const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
-const SEVERE_BACKPRESSURE_AVAILABLE_BUDGET: usize = 8 * 1024;
-const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(3);
+const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
+const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -552,12 +552,12 @@ fn should_segment_backpressured_payload(available_budget: usize, payload_len: us
     available_budget.saturating_add(BACKPRESSURED_FORWARD_SEGMENT_LEN) < payload_len
 }
 
-fn should_retry_whole_payload_after_backpressure(_available_budget: usize) -> bool {
-    true
+fn should_retry_whole_payload_after_backpressure(available_budget: usize) -> bool {
+    available_budget >= WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET
 }
 
 fn backpressured_payload_segment_len(available_budget: usize) -> usize {
-    if available_budget < SEVERE_BACKPRESSURE_AVAILABLE_BUDGET {
+    if available_budget < WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET {
         SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
     } else {
         BACKPRESSURED_FORWARD_SEGMENT_LEN
