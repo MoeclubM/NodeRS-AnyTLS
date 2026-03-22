@@ -1472,9 +1472,30 @@ def write_outputs(
                     ),
                 }
             )
+            current_row = scenario_rows.get(current_impl)
+            current_curve_avg = current_row.get("curve_avg_mbps") if current_row else None
+            if (
+                case.netem_profile
+                and isinstance(current_curve_avg, (int, float))
+                and isinstance(current_tail, (int, float))
+                and float(current_curve_avg) > 0.0
+                and float(current_tail) / float(current_curve_avg) >= 1.5
+            ):
+                benchmark_notes.append(
+                    {
+                        "scenario": case.name,
+                        "impl": current_impl,
+                        "severity": "info",
+                        "kind": "prefer_tail_metric",
+                        "message": (
+                            f"steady-state tail {float(current_tail):.2f} Mbps is "
+                            f"{float(current_tail) / float(current_curve_avg):.2f}x aggregate throughput; "
+                            "prefer tail throughput for weak-link steady-state comparisons"
+                        ),
+                    }
+                )
 
             if case.netem_profile:
-                current_row = scenario_rows.get(current_impl)
                 current_spread = (
                     float(current_row["mbps_attempt_spread_pct"])
                     if current_row and isinstance(current_row.get("mbps_attempt_spread_pct"), (int, float))
@@ -1542,7 +1563,7 @@ def write_outputs(
         lines.extend(
             [
                 "",
-                "## Long Connection Tail Comparison",
+                "## Steady-State Tail Throughput",
                 "",
                 "| Scenario | Current Tail Mbps | Best Prev Tail Mbps | Sing-box Tail Mbps | Current vs Best Prev | Current vs Sing-box |",
                 "| --- | --- | --- | --- | --- | --- |",
@@ -1603,6 +1624,7 @@ def write_outputs(
                 "latency": latency_summary_rows,
                 "stability": stability_summary_rows,
                 "curve_summary": curve_summary_rows,
+                "steady_state_tail_throughput": curve_tail_rows,
                 "curve_tail_comparison": curve_tail_rows,
                 "lossy_repeat_summary": lossy_repeat_rows,
                 "notes": benchmark_notes,
