@@ -778,7 +778,8 @@ mod tests {
         pump_copy, write_chunk_batch_for_test,
     };
     use super::{
-        BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload, read_exact_payload,
+        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload,
+        read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
