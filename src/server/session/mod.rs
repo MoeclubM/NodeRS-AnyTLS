@@ -489,6 +489,15 @@ async fn forward_buffered_inbound_payload(
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
 ) -> anyhow::Result<()> {
+    forward_buffered_inbound_payload_inner(inbound, control, payload, true).await
+}
+
+async fn forward_buffered_inbound_payload_inner(
+    inbound: &channel::InboundSender,
+    control: Arc<SessionControl>,
+    payload: PayloadBuffer,
+    allow_seeded_tail_retry: bool,
+) -> anyhow::Result<()> {
     // sing-anytls keeps PSH delivery as a whole-frame backpressure boundary instead of
     // re-slicing the payload under pressure. Our frame size is already capped to u16::MAX,
     // so forwarding the pooled buffer as a single unit avoids extra copies and fragmentation.
@@ -542,6 +551,7 @@ async fn forward_buffered_inbound_payload(
                 control,
                 payload,
                 backpressured_payload_segment_len(available_budget),
+                allow_seeded_tail_retry,
             )
             .await
         }
@@ -569,22 +579,102 @@ async fn forward_backpressured_inbound_payload(
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
     segment_len: usize,
+    allow_seeded_tail_retry: bool,
 ) -> anyhow::Result<()> {
     let segment_len = segment_len.max(1);
     let bytes = payload.into_vec();
-    for segment in bytes.chunks(segment_len) {
-        let segment = PayloadBuffer::new(segment.to_vec());
-        match inbound.try_send_data(segment) {
-            Ok(()) | Err(channel::TrySendError::Closed) => {}
-            Err(channel::TrySendError::Full(segment)) => {
-                tokio::select! {
-                    _ = control.cancelled() => return Ok(()),
-                    result = inbound.send_data(segment) => result?,
+    if allow_seeded_tail_retry && bytes.len() > segment_len {
+        let head = PayloadBuffer::new(bytes[..segment_len].to_vec());
+        deliver_backpressured_segment(inbound, control.clone(), head).await?;
+        let tail = PayloadBuffer::new(bytes[segment_len..].to_vec());
+        return forward_seeded_tail_payload(inbound, control, tail).await;
+    }
+    forward_segmented_backpressured_inbound_payload(inbound, control, bytes, segment_len).await
+}
+
+async fn forward_seeded_tail_payload(
+    inbound: &channel::InboundSender,
+    control: Arc<SessionControl>,
+    payload: PayloadBuffer,
+) -> anyhow::Result<()> {
+    match inbound.try_send_data(payload) {
+        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+        Err(channel::TrySendError::Full(payload)) => {
+            if payload.len() <= BACKPRESSURED_FORWARD_SEGMENT_LEN {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
+            }
+            let available_budget = inbound.available_send_budget();
+            if !should_segment_backpressured_payload(available_budget, payload.len()) {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
+            }
+            let mut payload = payload;
+            if should_retry_whole_payload_after_backpressure(available_budget) {
+                let deadline = tokio::time::Instant::now() + WHOLE_PAYLOAD_RETRY_GRACE;
+                loop {
+                    tokio::task::yield_now().await;
+                    if control.is_cancelled() {
+                        return Ok(());
+                    }
+                    match inbound.try_send_data(payload) {
+                        Ok(()) | Err(channel::TrySendError::Closed) => return Ok(()),
+                        Err(channel::TrySendError::Full(next_payload)) => {
+                            payload = next_payload;
+                            if tokio::time::Instant::now() >= deadline {
+                                break;
+                            }
+                        }
+                    }
                 }
             }
+            let available_budget = inbound.available_send_budget();
+            if !should_segment_backpressured_payload(available_budget, payload.len()) {
+                return tokio::select! {
+                    _ = control.cancelled() => Ok(()),
+                    result = inbound.send_data(payload) => result,
+                };
+            }
+            forward_segmented_backpressured_inbound_payload(
+                inbound,
+                control,
+                payload.into_vec(),
+                backpressured_payload_segment_len(available_budget),
+            )
+            .await
         }
     }
+}
+
+async fn forward_segmented_backpressured_inbound_payload(
+    inbound: &channel::InboundSender,
+    control: Arc<SessionControl>,
+    bytes: Vec<u8>,
+    segment_len: usize,
+) -> anyhow::Result<()> {
+    for segment in bytes.chunks(segment_len) {
+        let segment = PayloadBuffer::new(segment.to_vec());
+        deliver_backpressured_segment(inbound, control.clone(), segment).await?;
+    }
     Ok(())
+}
+
+async fn deliver_backpressured_segment(
+    inbound: &channel::InboundSender,
+    control: Arc<SessionControl>,
+    segment: PayloadBuffer,
+) -> anyhow::Result<()> {
+    match inbound.try_send_data(segment) {
+        Ok(()) | Err(channel::TrySendError::Closed) => Ok(()),
+        Err(channel::TrySendError::Full(segment)) => tokio::select! {
+            _ = control.cancelled() => Ok(()),
+            result = inbound.send_data(segment) => result,
+        },
+    }
 }
 
 async fn handle_stream(
@@ -1219,7 +1309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressured_whole_payload_falls_back_to_segments() {
+    async fn backpressured_whole_payload_seeds_then_retries_whole_tail() {
         let payload_len = 48 * 1024;
         let first_payload_len = 4 * 1024;
         let blocker_payload_len = 60 * 1024;
@@ -1268,7 +1358,7 @@ mod tests {
 
         let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("first fallback segment should arrive")
+            .expect("seed fallback segment should arrive")
             .expect("third inbound message");
         let InboundMessage::Data(third) = third else {
             panic!("expected third data payload");
@@ -1279,27 +1369,16 @@ mod tests {
 
         let fourth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
-            .expect("second fallback segment should arrive")
+            .expect("whole tail should arrive after seed segment")
             .expect("fourth inbound message");
         let InboundMessage::Data(fourth) = fourth else {
             panic!("expected fourth data payload");
         };
-        assert_eq!(fourth.len(), SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN);
-        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
-        drop(fourth);
-
-        let fifth = tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .expect("third fallback segment should arrive")
-            .expect("fifth inbound message");
-        let InboundMessage::Data(fifth) = fifth else {
-            panic!("expected fifth data payload");
-        };
         assert_eq!(
-            fifth.len(),
-            payload_len - (SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN * 2)
+            fourth.len(),
+            payload_len - SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN
         );
-        assert!(fifth.bytes().iter().all(|byte| *byte == 7));
+        assert!(fourth.bytes().iter().all(|byte| *byte == 7));
 
         forward_task
             .await
