@@ -41,6 +41,7 @@ const BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 32 * 1024;
 const SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN: usize = 16 * 1024;
 const WHOLE_PAYLOAD_RETRY_MIN_AVAILABLE_BUDGET: usize = 8 * 1024;
 const WHOLE_PAYLOAD_RETRY_GRACE: std::time::Duration = std::time::Duration::from_millis(1);
+const DISCARD_SCRATCH_LEN: usize = 8 * 1024;
 
 type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 const AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -98,9 +99,7 @@ async fn authenticate(
         .await
         .context("read preface padding length")? as usize;
     if padding_length > 0 {
-        let mut discard = vec![0u8; padding_length];
-        stream
-            .read_exact(&mut discard)
+        discard_exact(stream, padding_length)
             .await
             .context("read preface padding bytes")?;
     }
@@ -126,6 +125,8 @@ struct Session {
 struct SessionState {
     received_settings: AtomicBool,
     peer_version: AtomicU8,
+    sent_light_padding_update: AtomicBool,
+    saw_recent_padding: AtomicBool,
     streams: RwLock<FxHashMap<u32, StreamState>>,
 }
 
@@ -134,6 +135,8 @@ impl Default for SessionState {
         Self {
             received_settings: AtomicBool::new(false),
             peer_version: AtomicU8::new(0),
+            sent_light_padding_update: AtomicBool::new(false),
+            saw_recent_padding: AtomicBool::new(false),
             streams: RwLock::new(FxHashMap::default()),
         }
     }
@@ -199,7 +202,11 @@ impl Session {
                 CMD_PSH => self.handle_psh(header).await?,
                 CMD_SYN => self.handle_syn(header.stream_id).await?,
                 CMD_FIN => self.handle_fin(header.stream_id).await,
-                CMD_WASTE => self.discard(header.length as usize).await?,
+                CMD_WASTE => {
+                    self.maybe_send_light_padding_update().await?;
+                    self.state.saw_recent_padding.store(true, Ordering::Relaxed);
+                    self.discard(header.length as usize).await?
+                }
                 CMD_SETTINGS => self.handle_settings(header.length as usize).await?,
                 CMD_ALERT => self.handle_alert(header.length as usize).await?,
                 CMD_HEART_REQUEST => {
@@ -245,9 +252,16 @@ impl Session {
         let mut payload = self.payload_pool.take(header.length as usize);
         read_exact_payload(&mut self.reader, &mut payload, header.length as usize).await?;
 
-        if let Err(error) =
-            forward_buffered_inbound_payload(&inbound, self.lease.control(), payload).await
-        {
+        let prefer_segmented_large_payload =
+            self.state.saw_recent_padding.swap(false, Ordering::Relaxed);
+        let result = forward_buffered_inbound_payload(
+            &inbound,
+            self.lease.control(),
+            payload,
+            prefer_segmented_large_payload,
+        )
+        .await;
+        if let Err(error) = result {
             debug!(
                 stream_id = header.stream_id,
                 user = %self.user.uuid,
@@ -368,19 +382,22 @@ impl Session {
             .context("read settings frame")?;
         let settings = parse_settings(&bytes);
         self.state.received_settings.store(true, Ordering::Relaxed);
-        self.state.peer_version.store(
-            settings
-                .get("v")
-                .and_then(|value| value.parse::<u8>().ok())
-                .unwrap_or_default(),
-            Ordering::Relaxed,
-        );
+        let peer_version = settings
+            .get("v")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or_default();
+        self.state
+            .peer_version
+            .store(peer_version, Ordering::Relaxed);
+        if peer_version >= 2 {
+            self.maybe_send_light_padding_update().await?;
+        }
 
         let md5_mismatch = settings
             .get("padding-md5")
             .map(|value| value != &padding_md5(self.padding.raw_lines()))
             .unwrap_or(false);
-        if md5_mismatch {
+        if md5_mismatch && !self.state.sent_light_padding_update.load(Ordering::Relaxed) {
             self.write_frame(
                 CMD_UPDATE_PADDING_SCHEME,
                 0,
@@ -412,6 +429,33 @@ impl Session {
         discard_exact(&mut self.reader, length).await
     }
 
+    async fn maybe_send_light_padding_update(&self) -> anyhow::Result<()> {
+        if self.state.peer_version.load(Ordering::Relaxed) < 2 {
+            return Ok(());
+        }
+        if self
+            .state
+            .sent_light_padding_update
+            .swap(true, Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let default_lines = PaddingScheme::default_lines();
+        let minimal_lines = PaddingScheme::minimal_lines();
+        if self.padding.raw_lines() != default_lines.as_slice() {
+            return Ok(());
+        }
+        if self.padding.raw_lines() == minimal_lines.as_slice() {
+            return Ok(());
+        }
+        self.write_frame(
+            CMD_UPDATE_PADDING_SCHEME,
+            0,
+            minimal_lines.join("\n").as_bytes(),
+        )
+        .await
+    }
+
     async fn write_frame(&self, cmd: u8, stream_id: u32, payload: &[u8]) -> anyhow::Result<()> {
         write_frame(&self.writer, cmd, stream_id, payload).await
     }
@@ -441,11 +485,16 @@ where
     if length == 0 {
         return Ok(());
     }
-    let mut discard = vec![0u8; length];
-    reader
-        .read_exact(&mut discard)
-        .await
-        .context("discard frame payload")?;
+    let mut remaining = length;
+    let mut scratch = [0u8; DISCARD_SCRATCH_LEN];
+    while remaining > 0 {
+        let read_len = remaining.min(scratch.len());
+        reader
+            .read_exact(&mut scratch[..read_len])
+            .await
+            .context("discard frame payload")?;
+        remaining -= read_len;
+    }
     Ok(())
 }
 
@@ -488,7 +537,19 @@ async fn forward_buffered_inbound_payload(
     inbound: &channel::InboundSender,
     control: Arc<SessionControl>,
     payload: PayloadBuffer,
+    prefer_segmented_large_payload: bool,
 ) -> anyhow::Result<()> {
+    if prefer_segmented_large_payload && payload.len() > BACKPRESSURED_FORWARD_SEGMENT_LEN {
+        // Padding-heavy uploads interleave CMD_WASTE bursts with real payloads. Segment the next
+        // large payload immediately so those bursts do not force a full-frame queue boundary.
+        return forward_backpressured_inbound_payload(
+            inbound,
+            control,
+            payload,
+            BACKPRESSURED_FORWARD_SEGMENT_LEN,
+        )
+        .await;
+    }
     // sing-anytls keeps PSH delivery as a whole-frame backpressure boundary instead of
     // re-slicing the payload under pressure. Our frame size is already capped to u16::MAX,
     // so forwarding the pooled buffer as a single unit avoids extra copies and fragmentation.
@@ -777,11 +838,11 @@ mod tests {
     use super::io::pump_inbound_to_remote;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
-        pump_copy, write_chunk_batch_for_test,
+        coalesce_download_reads_without_deferred_wait, pump_copy, write_chunk_batch_for_test,
     };
     use super::{
-        SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN, forward_buffered_inbound_payload,
-        read_exact_payload,
+        BACKPRESSURED_FORWARD_SEGMENT_LEN, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
+        forward_buffered_inbound_payload, read_exact_payload,
     };
     use crate::accounting::{Accounting, SessionControl};
     use crate::server::traffic::TrafficRecorder;
@@ -1133,6 +1194,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_download_chunk_skips_deferred_coalesce_wait() {
+        let mut reader = DelayedSegmentedReader::new(
+            Duration::from_millis(1),
+            [vec![1u8; 1024], vec![2u8; 1024]],
+        );
+        let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
+
+        let first = reader
+            .read(&mut buffer[..1024])
+            .await
+            .expect("read first chunk");
+        assert_eq!(first, 1024);
+
+        let (filled, saw_eof) =
+            coalesce_download_reads_without_deferred_wait(&mut reader, &mut buffer, first, 2048)
+                .await
+                .expect("skip deferred coalesce wait");
+
+        assert_eq!(filled, 1024);
+        assert!(!saw_eof);
+        assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+    }
+
+    #[tokio::test]
     async fn coalesces_immediately_available_large_download_reads_without_waiting() {
         let mut reader = SegmentedReader::new([vec![1u8; 32 * 1024], vec![2u8; 24 * 1024]]);
         let mut buffer = vec![0u8; MAX_FRAME_PAYLOAD_LEN];
@@ -1203,7 +1288,7 @@ mod tests {
         let control = SessionControl::new();
         let payload = PayloadBuffer::new(vec![7u8; payload_len]);
 
-        forward_buffered_inbound_payload(&inbound, control, payload)
+        forward_buffered_inbound_payload(&inbound, control, payload, false)
             .await
             .expect("forward buffered payload");
 
@@ -1216,6 +1301,42 @@ mod tests {
         };
         assert_eq!(first.len(), payload_len);
         assert!(first.bytes().iter().all(|byte| *byte == 7));
+    }
+
+    #[tokio::test]
+    async fn padding_biased_large_payload_segments_immediately() {
+        let payload_len = 48 * 1024;
+        let (inbound, mut rx) = bounded_inbound_channel(8, payload_len * 2);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+
+        forward_buffered_inbound_payload(&inbound, control, payload, true)
+            .await
+            .expect("forward buffered payload");
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first segment should arrive")
+            .expect("first inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected first data payload");
+        };
+        assert_eq!(first.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert!(first.bytes().iter().all(|byte| *byte == 7));
+        drop(first);
+
+        let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("second segment should arrive")
+            .expect("second inbound message");
+        let InboundMessage::Data(second) = second else {
+            panic!("expected second data payload");
+        };
+        assert_eq!(
+            second.len(),
+            payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN
+        );
+        assert!(second.bytes().iter().all(|byte| *byte == 7));
     }
 
     #[tokio::test]
@@ -1234,7 +1355,7 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_buffered_inbound_payload(&inbound, control, payload).await }
+            async move { forward_buffered_inbound_payload(&inbound, control, payload, false).await }
         });
         tokio::task::yield_now().await;
 
@@ -1307,7 +1428,7 @@ mod tests {
         let forward_task = tokio::spawn({
             let inbound = inbound.clone();
             let control = control.clone();
-            async move { forward_buffered_inbound_payload(&inbound, control, payload).await }
+            async move { forward_buffered_inbound_payload(&inbound, control, payload, false).await }
         });
         tokio::task::yield_now().await;
 

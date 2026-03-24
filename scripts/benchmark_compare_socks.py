@@ -184,6 +184,7 @@ def worker_upload(
     stats: WorkerStats,
 ) -> None:
     sock, connect_ms = socks5_connect(proxy[0], proxy[1], target[0], target[1])
+    sock.settimeout(1.0)
     stats.connect_ms = connect_ms
     payload = b"\0" * chunk_size
     measurement_window.mark_connected()
@@ -193,9 +194,14 @@ def worker_upload(
             now = time.perf_counter()
             if now >= stop_time:
                 break
-            sock.sendall(payload)
+            try:
+                sent = sock.send(payload)
+            except (socket.timeout, TimeoutError):
+                continue
+            if sent <= 0:
+                break
             if now >= measure_start:
-                stats.bytes += len(payload)
+                stats.bytes += sent
                 stats.packets += 1
     finally:
         try:
@@ -333,13 +339,21 @@ def main() -> None:
         threads.append(thread)
         thread.start()
 
+    deadline = time.perf_counter() + args.seconds + 30.0
     for thread in threads:
-        thread.join()
+        remaining = max(deadline - time.perf_counter(), 0.1)
+        thread.join(remaining)
+
+    stuck = [index for index, thread in enumerate(threads) if thread.is_alive()]
+    if stuck:
+        measurement_window.cancel()
+        curve_done.set()
+        raise TimeoutError(f"worker threads did not exit: {stuck}")
 
     measurement_window.cancel()
     curve_done.set()
     if curve_thread is not None:
-        curve_thread.join()
+        curve_thread.join(timeout=5.0)
 
     if errors:
         raise errors[0]

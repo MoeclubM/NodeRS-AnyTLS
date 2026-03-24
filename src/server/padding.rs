@@ -12,6 +12,8 @@ const DEFAULT_SCHEME: &[&str] = &[
     "7=500-1000",
 ];
 
+const MINIMAL_SCHEME: &[&str] = &["stop=1", "0=1-1"];
+
 #[derive(Debug, Clone)]
 pub struct PaddingScheme {
     raw: Vec<String>,
@@ -26,6 +28,10 @@ impl Default for PaddingScheme {
 impl PaddingScheme {
     pub fn default_lines() -> Vec<String> {
         DEFAULT_SCHEME.iter().map(|line| line.to_string()).collect()
+    }
+
+    pub fn minimal_lines() -> Vec<String> {
+        MINIMAL_SCHEME.iter().map(|line| line.to_string()).collect()
     }
 
     pub fn from_lines(lines: &[String]) -> anyhow::Result<Self> {
@@ -91,6 +97,14 @@ mod tests {
         assert_eq!(
             PaddingScheme::default_lines().first().map(String::as_str),
             Some("stop=8")
+        );
+    }
+
+    #[test]
+    fn exposes_minimal_lines() {
+        assert_eq!(
+            PaddingScheme::minimal_lines().as_slice(),
+            &["stop=1".to_string(), "0=1-1".to_string()]
         );
     }
 

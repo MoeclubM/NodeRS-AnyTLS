@@ -239,6 +239,7 @@ where
 {
     let mut buffer = vec![0u8; 7 + MAX_FRAME_PAYLOAD_LEN];
     let mut total = 0u64;
+    let mut sent_first_payload = false;
     loop {
         if control.is_cancelled() {
             return Ok(total);
@@ -251,8 +252,18 @@ where
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
+        let allow_deferred_coalesce = sent_first_payload;
         let (read, saw_eof) = match download_coalesce_target(read) {
-            Some(target) => coalesce_download_reads(reader, &mut buffer[7..], read, target).await?,
+            Some(target) => {
+                coalesce_download_reads_inner(
+                    reader,
+                    &mut buffer[7..],
+                    read,
+                    target,
+                    allow_deferred_coalesce,
+                )
+                .await?
+            }
             None => (read, false),
         };
         #[cfg(target_env = "musl")]
@@ -271,6 +282,7 @@ where
         if let Some(activity) = activity.as_ref() {
             activity.record();
         }
+        sent_first_payload = true;
         if saw_eof {
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
@@ -462,11 +474,25 @@ fn upload_batch_policy_for_chunks(
     policy
 }
 
+#[cfg(test)]
 pub(super) async fn coalesce_download_reads<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    filled: usize,
+    target: usize,
+) -> anyhow::Result<(usize, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    coalesce_download_reads_inner(reader, buffer, filled, target, true).await
+}
+
+async fn coalesce_download_reads_inner<R>(
     reader: &mut R,
     buffer: &mut [u8],
     mut filled: usize,
     target: usize,
+    allow_deferred_coalesce: bool,
 ) -> anyhow::Result<(usize, bool)>
 where
     R: AsyncRead + Unpin,
@@ -491,14 +517,20 @@ where
             // Under high concurrency the next download chunk often lands on the next scheduler
             // turn instead of being immediately readable. Yield once before giving up so we can
             // coalesce another small slice without blocking on a full read.
-            None if !retried_after_yield && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
+            None if allow_deferred_coalesce
+                && !retried_after_yield
+                && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD =>
+            {
                 retried_after_yield = true;
                 tokio::task::yield_now().await;
             }
             // Lossy or jittery links can deliver the next 1 KiB slice just after the current
             // scheduler turn. Wait briefly once so concurrent small downloads can coalesce past
             // the immediate-flush threshold without turning this into a blocking read loop.
-            None if !retried_after_wait && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD => {
+            None if allow_deferred_coalesce
+                && !retried_after_wait
+                && filled < SMALL_DATA_FRAME_FLUSH_THRESHOLD =>
+            {
                 retried_after_wait = true;
                 match wait_for_available_read(
                     reader,
@@ -525,6 +557,19 @@ where
         }
     }
     Ok((filled, saw_eof))
+}
+
+#[cfg(test)]
+pub(super) async fn coalesce_download_reads_without_deferred_wait<R>(
+    reader: &mut R,
+    buffer: &mut [u8],
+    filled: usize,
+    target: usize,
+) -> anyhow::Result<(usize, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    coalesce_download_reads_inner(reader, buffer, filled, target, false).await
 }
 
 async fn try_read_available<R>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<Option<usize>>
