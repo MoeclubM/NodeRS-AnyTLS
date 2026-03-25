@@ -541,15 +541,19 @@ async fn forward_buffered_inbound_payload(
     prefer_segmented_large_payload: bool,
 ) -> anyhow::Result<()> {
     if prefer_segmented_large_payload && payload.len() > BACKPRESSURED_FORWARD_SEGMENT_LEN {
-        // Padding-heavy uploads interleave CMD_WASTE bursts with real payloads. Segment the next
-        // large payload immediately so those bursts do not force a full-frame queue boundary.
-        return forward_backpressured_inbound_payload(
-            inbound,
-            control,
-            payload,
-            BACKPRESSURED_FORWARD_SEGMENT_LEN,
-        )
-        .await;
+        let available_budget = inbound.available_send_budget();
+        if should_eagerly_segment_padding_biased_payload(available_budget, payload.len()) {
+            // Padding-heavy uploads interleave CMD_WASTE bursts with real payloads. Segment the
+            // next large payload only when the queue is still tight enough that a whole-frame
+            // enqueue would immediately bounce on budget again.
+            return forward_backpressured_inbound_payload(
+                inbound,
+                control,
+                payload,
+                backpressured_payload_segment_len(available_budget),
+            )
+            .await;
+        }
     }
     // sing-anytls keeps PSH delivery as a whole-frame backpressure boundary instead of
     // re-slicing the payload under pressure. Our frame size is already capped to u16::MAX,
@@ -608,6 +612,13 @@ async fn forward_buffered_inbound_payload(
             .await
         }
     }
+}
+
+fn should_eagerly_segment_padding_biased_payload(
+    available_budget: usize,
+    payload_len: usize,
+) -> bool {
+    should_segment_backpressured_payload(available_budget, payload_len)
 }
 
 fn should_segment_backpressured_payload(available_budget: usize, payload_len: usize) -> bool {
@@ -677,8 +688,7 @@ async fn handle_stream(
                     if context.send_synack {
                         write_frame(&context.writer, CMD_SYNACK, stream_id, &[]).await?;
                     }
-                    let (session_side, app_bridge_side) =
-                        tokio::io::duplex(UOT_BRIDGE_BUFFER_SIZE);
+                    let (session_side, app_bridge_side) = tokio::io::duplex(UOT_BRIDGE_BUFFER_SIZE);
                     let (mut session_reader, mut session_writer) = split(session_side);
                     // UOT keeps streaming through ChannelReader after the parser stage, so it can
                     // release byte budget as bytes are copied onward instead of waiting for a
@@ -1306,7 +1316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn padding_biased_large_payload_segments_immediately() {
+    async fn padding_biased_large_payload_keeps_whole_when_queue_has_budget() {
         let payload_len = 48 * 1024;
         let (inbound, mut rx) = bounded_inbound_channel(8, payload_len * 2);
         let control = SessionControl::new();
@@ -1318,13 +1328,44 @@ mod tests {
 
         let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await
+            .expect("whole payload should arrive")
+            .expect("inbound message");
+        let InboundMessage::Data(first) = first else {
+            panic!("expected data payload");
+        };
+        assert_eq!(first.len(), payload_len);
+        assert!(first.bytes().iter().all(|byte| *byte == 7));
+    }
+
+    #[tokio::test]
+    async fn padding_biased_large_payload_segments_when_budget_is_tight() {
+        let payload_len = 48 * 1024;
+        let first_payload_len = 52 * 1024;
+        let budget_len = 64 * 1024;
+        let (inbound, mut rx) = bounded_inbound_channel(8, budget_len);
+        let control = SessionControl::new();
+        let payload = PayloadBuffer::new(vec![7u8; payload_len]);
+
+        inbound
+            .try_send_data(PayloadBuffer::new(vec![3u8; first_payload_len]))
+            .expect("fill queue budget with first payload");
+
+        let forward_task = tokio::spawn({
+            let inbound = inbound.clone();
+            let control = control.clone();
+            async move { forward_buffered_inbound_payload(&inbound, control, payload, true).await }
+        });
+        tokio::task::yield_now().await;
+
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
             .expect("first segment should arrive")
             .expect("first inbound message");
         let InboundMessage::Data(first) = first else {
             panic!("expected first data payload");
         };
-        assert_eq!(first.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
-        assert!(first.bytes().iter().all(|byte| *byte == 7));
+        assert_eq!(first.len(), first_payload_len);
+        assert!(first.bytes().iter().all(|byte| *byte == 3));
         drop(first);
 
         let second = tokio::time::timeout(Duration::from_millis(100), rx.recv())
@@ -1334,11 +1375,24 @@ mod tests {
         let InboundMessage::Data(second) = second else {
             panic!("expected second data payload");
         };
-        assert_eq!(
-            second.len(),
-            payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN
-        );
+        assert_eq!(second.len(), BACKPRESSURED_FORWARD_SEGMENT_LEN);
         assert!(second.bytes().iter().all(|byte| *byte == 7));
+        drop(second);
+
+        let third = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("third segment should arrive")
+            .expect("third inbound message");
+        let InboundMessage::Data(third) = third else {
+            panic!("expected third data payload");
+        };
+        assert_eq!(third.len(), payload_len - BACKPRESSURED_FORWARD_SEGMENT_LEN);
+        assert!(third.bytes().iter().all(|byte| *byte == 7));
+
+        forward_task
+            .await
+            .expect("join forward task")
+            .expect("forward buffered payload");
     }
 
     #[tokio::test]
