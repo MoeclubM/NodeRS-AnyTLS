@@ -55,6 +55,13 @@ NETEM_PROFILES = {
     "jittery-lossy": "delay 40ms 150ms distribution paretonormal loss 6%",
 }
 
+SINGLE_HOST_NAMESPACE = "bench-anytls-client"
+SINGLE_HOST_HOST_VETH = "veth-atls-h"
+SINGLE_HOST_CLIENT_VETH = "veth-atls-c"
+SINGLE_HOST_HOST_IP = "169.254.201.1"
+SINGLE_HOST_CLIENT_IP = "169.254.201.2"
+SINGLE_HOST_PREFIX_LEN = 30
+
 
 @dataclass(frozen=True)
 class Scenario:
@@ -328,6 +335,21 @@ def ssh_connect(host: str, *, username: str, password: str) -> paramiko.SSHClien
     return client
 
 
+def ensure_ssh_active(
+    ssh: paramiko.SSHClient,
+    *,
+    host: str,
+    username: str,
+    password: str,
+) -> paramiko.SSHClient:
+    transport = ssh.get_transport()
+    if transport is not None and transport.is_active():
+        return ssh
+    with contextlib.suppress(Exception):
+        ssh.close()
+    return ssh_connect(host, username=username, password=password)
+
+
 def run(ssh: paramiko.SSHClient, cmd: str, *, timeout: int = 120, check: bool = True) -> tuple[int, str, str]:
     wrapped = f"bash -lc {shlex.quote(cmd)}"
     stdin, stdout, stderr = ssh.exec_command(wrapped, timeout=timeout)
@@ -359,6 +381,12 @@ def run(ssh: paramiko.SSHClient, cmd: str, *, timeout: int = 120, check: bool = 
     return code, out, err
 
 
+def wrap_exec(cmd: str, *, exec_prefix: str | None = None) -> str:
+    if not exec_prefix:
+        return cmd
+    return f"{exec_prefix} bash -lc {shlex.quote(cmd)}"
+
+
 def put_text(sftp: paramiko.SFTPClient, remote_path: str, text: str, mode: int = 0o644) -> None:
     with sftp.file(remote_path, "w") as handle:
         handle.write(text)
@@ -366,11 +394,38 @@ def put_text(sftp: paramiko.SFTPClient, remote_path: str, text: str, mode: int =
 
 
 def put_file(sftp: paramiko.SFTPClient, local_path: pathlib.Path, remote_path: str, mode: int = 0o755) -> None:
-    sftp.put(str(local_path), remote_path)
-    sftp.chmod(remote_path, mode)
+    local_size = local_path.stat().st_size
+    with contextlib.suppress(IOError):
+        remote_size = sftp.stat(remote_path).st_size
+        if remote_size == local_size:
+            sftp.chmod(remote_path, mode)
+            return
+        sftp.remove(remote_path)
+
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            sftp.put(str(local_path), remote_path)
+            sftp.chmod(remote_path, mode)
+            return
+        except OSError as error:
+            last_error = error
+            with contextlib.suppress(IOError):
+                sftp.remove(remote_path)
+            time.sleep(0.5)
+    assert last_error is not None
+    raise last_error
 
 
-def wait_port(ssh: paramiko.SSHClient, host: str, port: int, *, timeout_s: float = 30.0, label: str) -> None:
+def wait_port(
+    ssh: paramiko.SSHClient,
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = 30.0,
+    label: str,
+    exec_prefix: str | None = None,
+) -> None:
     deadline = time.time() + timeout_s
     probe = (
         "python3 - <<'PY'\n"
@@ -384,7 +439,7 @@ def wait_port(ssh: paramiko.SSHClient, host: str, port: int, *, timeout_s: float
         "PY"
     )
     while time.time() < deadline:
-        code, _, _ = run(ssh, probe, timeout=10, check=False)
+        code, _, _ = run(ssh, wrap_exec(probe, exec_prefix=exec_prefix), timeout=10, check=False)
         if code == 0:
             return
         time.sleep(0.5)
@@ -408,7 +463,11 @@ if [ -d {shlex.quote(root)}/run ]; then
 fi
 pkill -f {shlex.quote(root)} 2>/dev/null || true
 tc qdisc del dev lo root 2>/dev/null || true
+tc qdisc del dev {shlex.quote(SINGLE_HOST_HOST_VETH)} root 2>/dev/null || true
 tc qdisc del dev $(ip -4 route show default | awk '{{print $5}}' | head -n1) root 2>/dev/null || true
+ip netns pids {shlex.quote(SINGLE_HOST_NAMESPACE)} 2>/dev/null | xargs -r kill 2>/dev/null || true
+ip netns del {shlex.quote(SINGLE_HOST_NAMESPACE)} 2>/dev/null || true
+ip link del {shlex.quote(SINGLE_HOST_HOST_VETH)} 2>/dev/null || true
 exit 0
 """
     run(ssh, cmd, timeout=30, check=False)
@@ -441,17 +500,19 @@ def start_bg(
     ready_host: str | None = None,
     ready_port: int | None = None,
     ready_label: str,
+    exec_prefix: str | None = None,
 ) -> None:
     stop_named(ssh, root=root, name=name)
+    launched_cmd = wrap_exec(cmd, exec_prefix=exec_prefix)
     remote_cmd = f"""
 set -e
 mkdir -p {shlex.quote(root)}/logs {shlex.quote(root)}/run
-nohup {cmd} > {shlex.quote(root)}/logs/{name}.log 2>&1 < /dev/null &
+nohup {launched_cmd} > {shlex.quote(root)}/logs/{name}.log 2>&1 < /dev/null &
 echo $! > {shlex.quote(root)}/run/{name}.pid
 """
     run(ssh, remote_cmd, timeout=20)
     if ready_host is not None and ready_port is not None:
-        wait_port(ssh, ready_host, ready_port, timeout_s=30.0, label=ready_label)
+        wait_port(ssh, ready_host, ready_port, timeout_s=30.0, label=ready_label, exec_prefix=exec_prefix)
 
 
 def route_info(ssh: paramiko.SSHClient, dest_ip: str) -> tuple[str, str]:
@@ -478,21 +539,43 @@ tc filter add dev {shlex.quote(dev)} protocol ip parent 1:0 prio 1 u32 match ip 
     run(ssh, cmd, timeout=20)
 
 
-def apply_single_host_netem(ssh: paramiko.SSHClient, *, profile_spec: str, ports: list[int]) -> None:
-    parts = [
-        "set -e",
-        "tc qdisc replace dev lo root handle 1: prio bands 4",
-        f"tc qdisc replace dev lo parent 1:4 handle 40: netem {profile_spec}",
-        "tc filter del dev lo parent 1:0 protocol ip prio 1 2>/dev/null || true",
-    ]
-    for port in ports:
-        parts.append(
-            f"tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dport {port} 0xffff flowid 1:4"
-        )
-        parts.append(
-            f"tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip sport {port} 0xffff flowid 1:4"
-        )
-    run(ssh, "\n".join(parts), timeout=20)
+def setup_single_host_client_namespace(ssh: paramiko.SSHClient) -> None:
+    cmd = f"""
+set -e
+ip netns del {shlex.quote(SINGLE_HOST_NAMESPACE)} 2>/dev/null || true
+ip link del {shlex.quote(SINGLE_HOST_HOST_VETH)} 2>/dev/null || true
+ip netns add {shlex.quote(SINGLE_HOST_NAMESPACE)}
+ip link add {shlex.quote(SINGLE_HOST_HOST_VETH)} type veth peer name {shlex.quote(SINGLE_HOST_CLIENT_VETH)}
+ip link set {shlex.quote(SINGLE_HOST_CLIENT_VETH)} netns {shlex.quote(SINGLE_HOST_NAMESPACE)}
+ip addr add {SINGLE_HOST_HOST_IP}/{SINGLE_HOST_PREFIX_LEN} dev {shlex.quote(SINGLE_HOST_HOST_VETH)}
+ip link set {shlex.quote(SINGLE_HOST_HOST_VETH)} up
+ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)} ip link set lo up
+ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)} ip addr add {SINGLE_HOST_CLIENT_IP}/{SINGLE_HOST_PREFIX_LEN} dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)}
+ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)} ip link set {shlex.quote(SINGLE_HOST_CLIENT_VETH)} up
+ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)} ip route replace default via {SINGLE_HOST_HOST_IP} dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)}
+"""
+    run(ssh, cmd, timeout=30)
+
+
+def apply_single_host_netem(ssh: paramiko.SSHClient, *, profile_spec: str) -> None:
+    apply_interconnect_netem(
+        ssh,
+        dev=SINGLE_HOST_HOST_VETH,
+        dest_ip=SINGLE_HOST_CLIENT_IP,
+        profile_spec=profile_spec,
+    )
+    client_cmd = f"""
+set -e
+tc qdisc replace dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)} root handle 1: prio bands 4
+tc qdisc replace dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)} parent 1:4 handle 40: netem {profile_spec}
+tc filter del dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)} parent 1:0 protocol ip prio 1 2>/dev/null || true
+tc filter add dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)} protocol ip parent 1:0 prio 1 u32 match ip dst {shlex.quote(SINGLE_HOST_HOST_IP)}/32 flowid 1:4
+"""
+    run(
+        ssh,
+        wrap_exec(client_cmd, exec_prefix=f"ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)}"),
+        timeout=20,
+    )
 
 
 @contextmanager
@@ -512,11 +595,21 @@ def maybe_netem(
 
     profile_spec = NETEM_PROFILES[profile_name]
     if mode == "single-host":
-        apply_single_host_netem(server_ssh, profile_spec=profile_spec, ports=server_ports)
+        _ = server_ports
+        apply_single_host_netem(server_ssh, profile_spec=profile_spec)
         try:
             yield
         finally:
-            clear_netem(server_ssh, "lo")
+            clear_netem(server_ssh, SINGLE_HOST_HOST_VETH)
+            run(
+                server_ssh,
+                wrap_exec(
+                    f"tc qdisc del dev {shlex.quote(SINGLE_HOST_CLIENT_VETH)} root 2>/dev/null || true",
+                    exec_prefix=f"ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)}",
+                ),
+                timeout=10,
+                check=False,
+            )
         return
 
     assert client_ip is not None
@@ -612,6 +705,7 @@ def start_sing_clients(
     server_name: str,
     server_port: int,
     client_count: int,
+    exec_prefix: str | None = None,
 ) -> list[str]:
     sftp = client_ssh.open_sftp()
     proxies: list[str] = []
@@ -638,6 +732,7 @@ def start_sing_clients(
                 ready_host="127.0.0.1",
                 ready_port=socks_port,
                 ready_label="client",
+                exec_prefix=exec_prefix,
             )
             proxies.append(f"127.0.0.1:{socks_port}")
     finally:
@@ -659,6 +754,9 @@ def scenario_target(scenario: Scenario) -> tuple[int, str | None]:
 def run_compare(
     client_ssh: paramiko.SSHClient,
     *,
+    client_host: str,
+    username: str,
+    password: str,
     client_root: str,
     run_id: str,
     scenario: Scenario,
@@ -666,6 +764,7 @@ def run_compare(
     attempt: int,
     proxies: list[str],
     local_run: pathlib.Path,
+    exec_prefix: str | None = None,
 ) -> tuple[dict, dict | None, pathlib.Path, pathlib.Path | None]:
     target_port, http_path = scenario_target(scenario)
     slug = f"{scenario.name}-{impl_name}-attempt-{attempt}"
@@ -697,6 +796,7 @@ def run_compare(
     stdout_local = local_run / pathlib.Path(remote_stdout).name
     stderr_local = local_run / f"{run_id}-{slug}.stderr.txt"
     shell_cmd = "set -o pipefail; " + " ".join(shlex.quote(part) for part in cmd) + f" | tee {shlex.quote(remote_stdout)}"
+    shell_cmd = wrap_exec(shell_cmd, exec_prefix=exec_prefix)
     code, stdout_text, stderr_text = run(client_ssh, shell_cmd, timeout=scenario.seconds + 120, check=False)
     stdout_local.write_text(stdout_text, encoding="utf-8")
     if stderr_text.strip():
@@ -724,6 +824,7 @@ def run_compare(
 
     curve_summary = None
     curve_local = None
+    client_ssh = ensure_ssh_active(client_ssh, host=client_host, username=username, password=password)
     sftp = client_ssh.open_sftp()
     try:
         if remote_curve and code == 0 and metrics.get("status") != "fail":
@@ -1016,8 +1117,8 @@ def current_commit() -> str:
     return os.popen(f'git -C "{ROOT}" rev-parse --short HEAD').read().strip()
 
 
-def ping_summary(ssh: paramiko.SSHClient, host: str, *, local_run: pathlib.Path) -> dict:
-    _, out, _ = run(ssh, f"ping -c 10 {shlex.quote(host)}", timeout=30)
+def ping_summary(ssh: paramiko.SSHClient, host: str, *, local_run: pathlib.Path, exec_prefix: str | None = None) -> dict:
+    _, out, _ = run(ssh, wrap_exec(f"ping -c 10 {shlex.quote(host)}", exec_prefix=exec_prefix), timeout=30)
     (local_run / "ping.txt").write_text(out, encoding="utf-8")
     ping_match = re.search(r"= ([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+) ms", out)
     packet_loss_match = re.search(r"(\d+% packet loss)", out)
@@ -1078,14 +1179,13 @@ def collect_remote_artifacts(
     sftp = ssh.open_sftp()
     local_dir.mkdir(parents=True, exist_ok=True)
     try:
-        for remote_subdir in ("logs", "results"):
-            try:
-                for entry in sftp.listdir_attr(f"{root}/{remote_subdir}"):
-                    if remote_subdir == "results" and run_id not in entry.filename:
-                        continue
-                    sftp.get(f"{root}/{remote_subdir}/{entry.filename}", str(local_dir / entry.filename))
-            except IOError:
-                continue
+        try:
+            for entry in sftp.listdir_attr(f"{root}/results"):
+                if run_id not in entry.filename:
+                    continue
+                sftp.get(f"{root}/results/{entry.filename}", str(local_dir / entry.filename))
+        except IOError:
+            pass
     finally:
         sftp.close()
 
@@ -1143,14 +1243,29 @@ def main() -> None:
         print("[phase] prepare remote servers", flush=True)
         prepare_servers(server_ssh, server_root=server_root, server_name=server_name)
 
+        client_exec_prefix = None
         connect_host = "127.0.0.1" if args.mode == "single-host" else server_ip
+        ping_host = "127.0.0.1" if args.mode == "single-host" else args.nyc_host
+        if args.mode == "single-host":
+            print("[phase] prepare single-host client namespace", flush=True)
+            setup_single_host_client_namespace(client_ssh)
+            client_exec_prefix = f"ip netns exec {shlex.quote(SINGLE_HOST_NAMESPACE)}"
+            connect_host = SINGLE_HOST_HOST_IP
+            ping_host = SINGLE_HOST_HOST_IP
+
         print("[phase] wait server ports from client", flush=True)
         for port in [PORTS["current"], PORTS["v031"], PORTS["sing"]]:
-            wait_port(client_ssh, connect_host, port, timeout_s=30.0, label="client")
+            wait_port(
+                client_ssh,
+                connect_host,
+                port,
+                timeout_s=30.0,
+                label="client",
+                exec_prefix=client_exec_prefix,
+            )
 
         print("[phase] baseline ping", flush=True)
-        ping_host = "127.0.0.1" if args.mode == "single-host" else args.nyc_host
-        summary["ping"] = ping_summary(client_ssh, ping_host, local_run=local_run)
+        summary["ping"] = ping_summary(client_ssh, ping_host, local_run=local_run, exec_prefix=client_exec_prefix)
 
         raw_results: list[dict] = []
         impls = [("current", PORTS["current"]), ("v0.0.31", PORTS["v031"]), ("SingBox", PORTS["sing"])]
@@ -1170,6 +1285,12 @@ def main() -> None:
                     order = impls if attempt % 2 == 1 else list(reversed(impls))
                     for impl_name, port in order:
                         print(f"[run] {scenario.name} attempt {attempt} {impl_name}", flush=True)
+                        client_ssh = ensure_ssh_active(
+                            client_ssh,
+                            host=client_host,
+                            username=args.username,
+                            password=password,
+                        )
                         proxies = start_sing_clients(
                             client_ssh,
                             client_root=client_root,
@@ -1178,10 +1299,20 @@ def main() -> None:
                             server_name=server_name,
                             server_port=port,
                             client_count=scenario.parallel,
+                            exec_prefix=client_exec_prefix,
                         )
                         try:
+                            client_ssh = ensure_ssh_active(
+                                client_ssh,
+                                host=client_host,
+                                username=args.username,
+                                password=password,
+                            )
                             metrics, curve_summary, stdout_file, curve_file = run_compare(
                                 client_ssh,
+                                client_host=client_host,
+                                username=args.username,
+                                password=password,
                                 client_root=client_root,
                                 run_id=run_id,
                                 scenario=scenario,
@@ -1189,8 +1320,15 @@ def main() -> None:
                                 attempt=attempt,
                                 proxies=proxies,
                                 local_run=local_run,
+                                exec_prefix=client_exec_prefix,
                             )
                         finally:
+                            client_ssh = ensure_ssh_active(
+                                client_ssh,
+                                host=client_host,
+                                username=args.username,
+                                password=password,
+                            )
                             stop_sing_clients(client_ssh, client_root=client_root, client_count=scenario.parallel)
                         raw_results.append(
                             {
@@ -1209,6 +1347,8 @@ def main() -> None:
         summary["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         (local_run / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         (local_run / "report.md").write_text(build_markdown(summary), encoding="utf-8")
+        server_ssh = ensure_ssh_active(server_ssh, host=args.nyc_host, username=args.username, password=password)
+        client_ssh = ensure_ssh_active(client_ssh, host=client_host, username=args.username, password=password)
         collect_remote_artifacts(ssh=server_ssh, root=server_root, local_dir=local_run / "server", run_id=run_id)
         collect_remote_artifacts(ssh=client_ssh, root=client_root, local_dir=local_run / "client", run_id=run_id)
     finally:

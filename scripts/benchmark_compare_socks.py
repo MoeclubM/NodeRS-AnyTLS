@@ -69,10 +69,21 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
-def recv_until(sock: socket.socket, marker: bytes, *, limit: int = 1024 * 1024) -> tuple[bytes, bytes]:
+def recv_until(
+    sock: socket.socket,
+    marker: bytes,
+    *,
+    limit: int = 1024 * 1024,
+    deadline: float | None = None,
+) -> tuple[bytes, bytes]:
     buffer = bytearray()
     while marker not in buffer:
-        chunk = sock.recv(4096)
+        try:
+            chunk = sock.recv(4096)
+        except (socket.timeout, TimeoutError):
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("timed out waiting for marker") from None
+            continue
         if not chunk:
             raise EOFError("unexpected EOF while waiting for marker")
         buffer.extend(chunk)
@@ -459,7 +470,8 @@ def worker_http_download(
     measurement_window.mark_connected()
     measure_start, stop_time = measurement_window.wait()
     try:
-        _, remainder = recv_until(sock, b"\r\n\r\n")
+        header_deadline = time.perf_counter() + max(10.0, measurement_window.warmup_seconds + 8.0)
+        _, remainder = recv_until(sock, b"\r\n\r\n", deadline=header_deadline)
         if remainder and stats.first_byte_ms is None:
             stats.first_byte_ms = (time.perf_counter() - started) * 1000.0
         if remainder and time.perf_counter() >= measure_start:
