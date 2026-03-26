@@ -850,7 +850,8 @@ mod tests {
     use super::io::pump_inbound_to_remote;
     use super::io::{
         advance_chunk_batch, chunk_batch_policy, chunk_batch_slices, coalesce_download_reads,
-        coalesce_download_reads_without_deferred_wait, pump_copy, write_chunk_batch_for_test,
+        coalesce_download_reads_without_deferred_wait, first_download_frame_len, pump_copy,
+        write_chunk_batch_for_test,
     };
     use super::{
         BACKPRESSURED_FORWARD_SEGMENT_LEN, SEVERE_BACKPRESSURED_FORWARD_SEGMENT_LEN,
@@ -1227,6 +1228,13 @@ mod tests {
         assert_eq!(filled, 1024);
         assert!(!saw_eof);
         assert!(buffer[..1024].iter().all(|byte| *byte == 1));
+    }
+
+    #[test]
+    fn large_first_download_chunk_splits_off_flushable_prefix() {
+        assert_eq!(first_download_frame_len(false, 8 * 1024), 4 * 1024);
+        assert_eq!(first_download_frame_len(false, 4 * 1024), 0);
+        assert_eq!(first_download_frame_len(true, 8 * 1024), 0);
     }
 
     #[tokio::test]

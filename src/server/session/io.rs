@@ -266,14 +266,29 @@ where
             }
             None => (read, false),
         };
-        #[cfg(target_env = "musl")]
-        if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
-            write_prefixed_frame(&writer, CMD_PSH, stream_id, &mut buffer, read).await?;
+        let first_frame_len = first_download_frame_len(sent_first_payload, read);
+        if first_frame_len > 0 {
+            write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + first_frame_len]).await?;
+            let remaining = read - first_frame_len;
+            if remaining > 0 {
+                write_frame(
+                    &writer,
+                    CMD_PSH,
+                    stream_id,
+                    &buffer[7 + first_frame_len..7 + read],
+                )
+                .await?;
+            }
         } else {
+            #[cfg(target_env = "musl")]
+            if read > COMPACT_FRAME_PAYLOAD_THRESHOLD {
+                write_prefixed_frame(&writer, CMD_PSH, stream_id, &mut buffer, read).await?;
+            } else {
+                write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
+            }
+            #[cfg(not(target_env = "musl"))]
             write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
         }
-        #[cfg(not(target_env = "musl"))]
-        write_frame(&writer, CMD_PSH, stream_id, &buffer[7..7 + read]).await?;
         let transferred = read as u64;
         total += transferred;
         if let Some(traffic) = traffic.as_ref() {
@@ -287,6 +302,14 @@ where
             write_frame(&writer, CMD_FIN, stream_id, &[]).await?;
             return Ok(total);
         }
+    }
+}
+
+pub(super) fn first_download_frame_len(sent_first_payload: bool, read: usize) -> usize {
+    if sent_first_payload || read <= SMALL_DATA_FRAME_FLUSH_THRESHOLD {
+        0
+    } else {
+        SMALL_DATA_FRAME_FLUSH_THRESHOLD
     }
 }
 
