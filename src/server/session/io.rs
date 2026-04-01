@@ -19,6 +19,8 @@ use super::frame::{
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
     SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
 };
+#[cfg(target_env = "musl")]
+use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::writer::{FrameWriter, write_frame, write_frame_immediate};
 #[cfg(target_env = "musl")]
 use super::writer::{write_prefixed_frame, write_prefixed_frame_immediate};
