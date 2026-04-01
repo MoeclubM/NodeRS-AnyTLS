@@ -13,14 +13,14 @@ use crate::accounting::SessionControl;
 use super::super::activity::ActivityTracker;
 use super::super::traffic::TrafficRecorder;
 use super::channel::{BufferedChunk, InboundMessage};
+#[cfg(target_env = "musl")]
+use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::frame::{
     CMD_FIN, CMD_PSH, DEFAULT_UPLOAD_BATCH_IOVECS, DEFAULT_UPLOAD_BATCH_SIZE,
     LARGE_UPLOAD_BATCH_IOVECS, MAX_FRAME_PAYLOAD_LEN, MAX_UPLOAD_BATCH_IOVECS,
     SMALL_DATA_FRAME_FLUSH_THRESHOLD, SMALL_DOWNLOAD_COALESCE_WAIT, SMALL_PAYLOAD_LEN,
     SMALL_UPLOAD_BATCH_IOVECS, download_coalesce_target, upload_batch_policy,
 };
-#[cfg(target_env = "musl")]
-use super::frame::COMPACT_FRAME_PAYLOAD_THRESHOLD;
 use super::writer::{FrameWriter, write_frame, write_frame_immediate};
 #[cfg(target_env = "musl")]
 use super::writer::{write_prefixed_frame, write_prefixed_frame_immediate};
